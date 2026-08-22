@@ -52,7 +52,7 @@ jobs:
 
           for f in .cicd/secrets.dev .cicd/secrets.prod; do
             [ -f "$f" ] || continue
-            if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*=[a-z0-9-]+:(latest|[0-9]+)$'; then
+            if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*=[a-z0-9][a-z0-9_-]*:(latest|[0-9]+)$'; then
               echo "::error::$f 格式錯誤。這個檔案只能放 Secret Manager 的『名字』，不能放值："
               echo "::error::  正確 → DB_PASSWORD=myapp-db-password-dev:latest"
               echo "::error::  錯誤 → DB_PASSWORD=hunter2"

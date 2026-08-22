@@ -138,10 +138,13 @@ Cloud Run 用專屬的 `run-runtime` 執行，不用 default compute SA（那個
 ## GCP 環境設定
 
 ```bash
-./scripts/bootstrap-gcp.sh    # 可重複執行
+./scripts/bootstrap-gcp.sh      # 可重複執行
+./scripts/protect-ci-repo.sh    # 保護本 repo 自己的 main
 ```
 
 開 API、建 Artifact Registry、建兩組 SA、建 WIF pool/provider 與信任綁定，以及跨專案的 promote 讀取權。
+
+`protect-ci-repo.sh` 是獨立的一支，因為**本 repo 自己的 main 就是整個安全模型的根** —— GCP 的信任條件釘在 `ci/.github/workflows/deploy.yml@refs/heads/main`，能推這裡的 main 就等於能改寫兩個 GCP 專案所信任的部署邏輯。它不能沿用 `new-project.sh` 那份 ruleset：那份要求 `ci / 1 verify` 與 `ci / 2 build`，但本 repo 的 workflow 是 `workflow_call` 專用、在自己的 PR 上不會執行，那兩個 check 永遠不會回報，PR 會被永久卡住。所以本 repo 改用 `self-test.yml` 的 `check`。
 
 ---
 

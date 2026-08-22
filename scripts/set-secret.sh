@@ -46,7 +46,7 @@ gcloud secrets add-iam-policy-binding "$SECRET_NAME" --project="$PROJECT" \
 VER=$(gcloud secrets versions list "$SECRET_NAME" --project="$PROJECT" --limit=1 --format='value(name)')
 cat <<EOF
 
-✅ 已寫入 $PROJECT / $SECRET_NAME（版本 $VER）
+✅ 已寫入 $PROJECT / ${SECRET_NAME}（版本 ${VER}）
 
 下一步：在專案的 .cicd/secrets.${ENV_NAME} 加一行
     你的環境變數名=${SECRET_NAME}:latest

@@ -25,6 +25,20 @@ PROD_PROJECT=adamsourceinfo-prod
 log()  { printf '\n\033[1;34m▸ %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 
+# 新建的 service account 不會馬上出現在 IAM policy API 眼裡。這不是錯誤，是最終一致性，
+# 直接跑後續的 add-iam-policy-binding 會拿到 "does not exist"。重試而不是 sleep 固定秒數。
+retry() {
+  local n=0 max=12
+  until "$@"; do
+    n=$((n+1))
+    if [ "$n" -ge "$max" ]; then
+      echo "  ✗ 重試 ${max} 次仍失敗: $*" >&2
+      return 1
+    fi
+    sleep 5
+  done
+}
+
 bootstrap_project() {
   local PROJECT="$1" ENV_NAME="$2"
   local NUMBER
@@ -67,12 +81,12 @@ bootstrap_project() {
   ok "部署身分 SA: ${DEPLOYER}@${PROJECT}.iam.gserviceaccount.com"
 
   for ROLE in roles/run.admin roles/artifactregistry.writer; do
-    gcloud projects add-iam-policy-binding "$PROJECT" \
+    retry gcloud projects add-iam-policy-binding "$PROJECT" \
       --member="serviceAccount:${DEPLOYER}@${PROJECT}.iam.gserviceaccount.com" \
       --role="$ROLE" --condition=None --quiet >/dev/null
   done
   # 只能冒用「執行身分」這一個帳號，不是專案層級的 serviceAccountUser。
-  gcloud iam service-accounts add-iam-policy-binding "${RUNTIME}@${PROJECT}.iam.gserviceaccount.com" \
+  retry gcloud iam service-accounts add-iam-policy-binding "${RUNTIME}@${PROJECT}.iam.gserviceaccount.com" \
     --member="serviceAccount:${DEPLOYER}@${PROJECT}.iam.gserviceaccount.com" \
     --role="roles/iam.serviceAccountUser" --project="$PROJECT" --quiet >/dev/null
   ok "部署身分權限：run.admin + artifactregistry.writer + serviceAccountUser(限 ${RUNTIME})"
@@ -93,11 +107,11 @@ bootstrap_project() {
       --attribute-condition="assertion.repository_owner == '${ORG}'" \
       --quiet
   fi
-  ok "WIF provider: $PROVIDER（只接受 ${ORG} 底下的 repo）"
+  ok "WIF provider: ${PROVIDER}（只接受 ${ORG} 底下的 repo）"
 
   # 關鍵：能冒用部署身分的，只有 ci repo 的那一支 reusable workflow。
   # 各專案 repo 自己的 workflow 檔怎麼改都換不到憑證。
-  gcloud iam service-accounts add-iam-policy-binding "${DEPLOYER}@${PROJECT}.iam.gserviceaccount.com" \
+  retry gcloud iam service-accounts add-iam-policy-binding "${DEPLOYER}@${PROJECT}.iam.gserviceaccount.com" \
     --project="$PROJECT" --role="roles/iam.workloadIdentityUser" \
     --member="principalSet://iam.googleapis.com/projects/${NUMBER}/locations/global/workloadIdentityPools/${POOL}/attribute.job_workflow_ref/${WORKFLOW_REF}" \
     --quiet >/dev/null
@@ -109,7 +123,7 @@ bootstrap_project "$PROD_PROJECT" prod
 
 # promote 階段是用 prod 的部署身分去讀 dev 的 image，所以要跨專案讀取權。
 log "跨專案：prod 部署身分 → 讀 dev Artifact Registry"
-gcloud artifacts repositories add-iam-policy-binding "$AR_REPO" \
+retry gcloud artifacts repositories add-iam-policy-binding "$AR_REPO" \
   --location="$REGION" --project="$DEV_PROJECT" \
   --member="serviceAccount:${DEPLOYER}@${PROD_PROJECT}.iam.gserviceaccount.com" \
   --role="roles/artifactregistry.reader" --quiet >/dev/null

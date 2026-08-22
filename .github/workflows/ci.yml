@@ -38,7 +38,7 @@ jobs:
             exit 1
           fi
           if [ ! -f "$DOCKERFILE" ]; then
-            echo "::error::找不到 $DOCKERFILE。adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。"
+            echo "::error::找不到 ${DOCKERFILE}。adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。"
             exit 1
           fi
 
@@ -60,7 +60,7 @@ jobs:
             fi
           done
 
-          echo "✅ 契約檢查通過（service=$SERVICE）"
+          echo "✅ 契約檢查通過（service=${SERVICE}）"
 
   build:
     name: 2 build

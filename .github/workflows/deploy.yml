@@ -85,7 +85,7 @@ jobs:
           fi
 
           if [ ! -f "$DOCKERFILE" ]; then
-            echo "::error::找不到 $DOCKERFILE。adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。"
+            echo "::error::找不到 ${DOCKERFILE}。adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。"
             exit 1
           fi
 
@@ -217,7 +217,7 @@ jobs:
               case "$line" in ''|'#'*) continue;; esac
               SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@}${line}"
             done < "$SEC_FILE"
-            echo "已掛載 $SEC_FILE（只掛名字，值留在 Secret Manager）"
+            echo "已掛載 ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
           fi
 
           ARGS=(
@@ -279,7 +279,7 @@ jobs:
             fi
             sleep 10
           done
-          echo "::error::dev 健康檢查失敗（最後一次 HTTP $CODE，目標 $TARGET）。服務部署成功但沒有回應，請檢查應用程式是否有監聽 \$PORT。"
+          echo "::error::dev 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。服務部署成功但沒有回應，請檢查應用程式是否有監聽 \${PORT}。"
           exit 1
 
   # ── 5. resolve（只有 tag）──────────────────────────────────────────────────
@@ -432,7 +432,7 @@ jobs:
               case "$line" in ''|'#'*) continue;; esac
               SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@}${line}"
             done < "$SEC_FILE"
-            echo "已掛載 $SEC_FILE（只掛名字，值留在 Secret Manager）"
+            echo "已掛載 ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
           fi
 
           ARGS=(
@@ -497,5 +497,5 @@ jobs:
             fi
             sleep 10
           done
-          echo "::error::prod 健康檢查失敗（最後一次 HTTP $CODE，目標 $TARGET）。"
+          echo "::error::prod 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。"
           exit 1

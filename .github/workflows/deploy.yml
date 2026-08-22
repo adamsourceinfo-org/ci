@@ -201,14 +201,21 @@ jobs:
           ENV_FILE=".cicd/env.${ENV_NAME}"
           SEC_FILE=".cicd/secrets.${ENV_NAME}"
 
+          # 有 .cicd/env.<env> → --set-env-vars，此檔為唯一真相（刪掉一行，Cloud Run 上也會消失）
+          # 沒有             → --update-env-vars，只補 APP_ENV/APP_VERSION，
+          #                     完全不動你自己在 Cloud Run 主控台設的變數
           PAIRS="APP_ENV=${ENV_NAME}"
           [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
+          ENV_MODE="--update-env-vars"
           if [ -f "$ENV_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
               PAIRS="${PAIRS}@${line}"
             done < "$ENV_FILE"
-            echo "已套用 $ENV_FILE"
+            ENV_MODE="--set-env-vars"
+            echo "已套用 ${ENV_FILE}（宣告式：此檔為唯一真相）"
+          else
+            echo "沒有 ${ENV_FILE}，只補 APP_ENV/APP_VERSION，不動既有環境變數"
           fi
 
           SEC_PAIRS=""
@@ -228,7 +235,7 @@ jobs:
             --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
-            "--set-env-vars=^@^${PAIRS}"
+            "${ENV_MODE}=^@^${PAIRS}"
           )
           if [ -n "$SEC_PAIRS" ]; then
             ARGS+=("--set-secrets=^@^${SEC_PAIRS}")
@@ -416,14 +423,21 @@ jobs:
           ENV_FILE=".cicd/env.${ENV_NAME}"
           SEC_FILE=".cicd/secrets.${ENV_NAME}"
 
+          # 有 .cicd/env.<env> → --set-env-vars，此檔為唯一真相（刪掉一行，Cloud Run 上也會消失）
+          # 沒有             → --update-env-vars，只補 APP_ENV/APP_VERSION，
+          #                     完全不動你自己在 Cloud Run 主控台設的變數
           PAIRS="APP_ENV=${ENV_NAME}"
           [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
+          ENV_MODE="--update-env-vars"
           if [ -f "$ENV_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
               PAIRS="${PAIRS}@${line}"
             done < "$ENV_FILE"
-            echo "已套用 $ENV_FILE"
+            ENV_MODE="--set-env-vars"
+            echo "已套用 ${ENV_FILE}（宣告式：此檔為唯一真相）"
+          else
+            echo "沒有 ${ENV_FILE}，只補 APP_ENV/APP_VERSION，不動既有環境變數"
           fi
 
           SEC_PAIRS=""
@@ -443,7 +457,7 @@ jobs:
             --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
-            "--set-env-vars=^@^${PAIRS}"
+            "${ENV_MODE}=^@^${PAIRS}"
           )
           if [ -n "$SEC_PAIRS" ]; then
             ARGS+=("--set-secrets=^@^${SEC_PAIRS}")

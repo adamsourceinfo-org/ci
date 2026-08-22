@@ -73,5 +73,5 @@ jobs:
           DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           set -euo pipefail
-          docker build -f "$DOCKERFILE" -t ci-check:${GITHUB_SHA:0:7} .
+          docker build -f "$DOCKERFILE" -t "ci-check:${GITHUB_SHA:0:7}" .
           echo "✅ image 建置成功"

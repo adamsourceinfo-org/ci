@@ -158,3 +158,5 @@ Cloud Run 用專屬的 `run-runtime` 執行，不用 default compute SA（那個
 | `在 dev AR 找不到 sha-xxxxxxx` | 這個 commit 沒走過 main pipeline。先讓它進 main、dev 部署成功再打 tag |
 | `複製後 digest 不一致` | promote 的重點就是逐位元組相同，不一致必須中止 |
 | dev 健康檢查失敗 | 容器沒監聽 `$PORT`（Cloud Run 注入，預設 8080） |
+
+<!-- self-test 驗證用 -->

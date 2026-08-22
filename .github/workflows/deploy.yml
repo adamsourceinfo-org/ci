@@ -1,0 +1,501 @@
+# adamsourceinfo-org 共用部署流程。各專案只放一支 caller stub 呼叫這裡。
+#
+# 改你自己 repo 的 workflow 不會讓你拿到任何 GCP 權限 —— 換取雲端憑證的條件綁死在
+# "adamsourceinfo-org/ci/.github/workflows/deploy.yml@refs/heads/main"。從別的 workflow 呼叫換不到。
+#
+# 兩條路：
+#   push main → 部署 adamsourceinfo-dev
+#   push tag  → 把 main 建好的「同一個 image digest」搬到 adamsourceinfo-prod 部署
+#
+# tag 永遠不重新 build。prod 跑的 binary 逐位元組等於 dev 驗過的那一份。
+name: deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Cloud Run 服務名稱。留空則用 caller repo 名稱"
+        type: string
+        required: false
+        default: ""
+      region:
+        description: "Cloud Run 區域"
+        type: string
+        required: false
+        default: asia-east1
+      health_path:
+        description: "smoke test 打的路徑"
+        type: string
+        required: false
+        default: "/"
+      dockerfile:
+        description: "Dockerfile 路徑"
+        type: string
+        required: false
+        default: Dockerfile
+      allow_unauthenticated:
+        description: "是否開放未驗證存取"
+        type: boolean
+        required: false
+        default: true
+
+env:
+  DEV_PROJECT: adamsourceinfo-dev
+  DEV_PROJECT_NUMBER: "606393814183"
+  PROD_PROJECT: adamsourceinfo-prod
+  PROD_PROJECT_NUMBER: "197982716696"
+  AR_HOST: asia-east1-docker.pkg.dev
+  AR_REPO: apps
+  WIF_POOL: github
+  WIF_PROVIDER: adamsourceinfo-org
+  DEPLOYER_SA_ID: github-deployer
+  RUNTIME_SA_ID: run-runtime
+
+jobs:
+  # ── 1. verify ──────────────────────────────────────────────────────────────
+  # 契約檢查。tag 另外驗格式，並確認它指向 main 上的 commit —— 否則 prod 會部署到
+  # 從沒經過 dev 的程式碼。
+  verify:
+    name: 1 verify
+    runs-on: ubuntu-latest
+    outputs:
+      service: ${{ steps.contract.outputs.service }}
+      short_sha: ${{ steps.contract.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 檢查契約
+        id: contract
+        env:
+          IN_SERVICE: ${{ inputs.service }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+
+          SERVICE="${IN_SERVICE:-${GITHUB_REPOSITORY##*/}}"
+          if ! printf '%s' "$SERVICE" | grep -Eq '^[a-z]([-a-z0-9]*[a-z0-9])?$'; then
+            echo "::error::服務名稱 '$SERVICE' 不符合 Cloud Run 規則（小寫字母開頭，只能有小寫字母/數字/連字號）。請在 stub 用 service: 指定合法名稱。"
+            exit 1
+          fi
+          if [ ${#SERVICE} -gt 49 ]; then
+            echo "::error::服務名稱 '$SERVICE' 超過 49 字元。"
+            exit 1
+          fi
+
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error::找不到 $DOCKERFILE。adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。"
+            exit 1
+          fi
+
+          echo "service=$SERVICE"        >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "✅ service=$SERVICE  dockerfile=$DOCKERFILE  sha=${GITHUB_SHA:0:7}"
+
+      - name: 驗證 tag（僅 tag 觸發）
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '$TAG' 格式不對。正式發布的 tag 必須是 vMAJOR.MINOR.PATCH，例如 v1.0.3。"
+            echo "::error::（本 workflow 刻意接收所有 tag 再在這裡擋下來。用 glob 過濾的話，格式錯的 tag 會安靜地什麼都不發生，比紅燈難查得多。）"
+            exit 1
+          fi
+
+          if ! git branch -r --contains "$GITHUB_SHA" | grep -qE '^\s*origin/main$'; then
+            echo "::error::tag '$TAG' 指向的 commit ($GITHUB_SHA) 不在 main 上。"
+            echo "::error::prod 只部署 main 驗證過的 image。請把 commit 併進 main 之後再打 tag。"
+            exit 1
+          fi
+          echo "✅ tag $TAG 格式正確且指向 main"
+
+  # ── 2. build-push（只有 main）───────────────────────────────────────────────
+  build-push:
+    name: 2 build-push → dev AR
+    if: github.ref_type == 'branch'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.DEV_PROJECT }}
+          workload_identity_provider: projects/${{ env.DEV_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.DEV_PROJECT }}.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: docker 登入 Artifact Registry
+        run: gcloud auth configure-docker "${AR_HOST}" --quiet
+
+      - name: build & push
+        id: push
+        env:
+          SERVICE: ${{ needs.verify.outputs.service }}
+          SHORT_SHA: ${{ needs.verify.outputs.short_sha }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          IMAGE="${AR_HOST}/${DEV_PROJECT}/${AR_REPO}/${SERVICE}"
+
+          docker build -f "$DOCKERFILE" -t "${IMAGE}:sha-${SHORT_SHA}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:sha-${SHORT_SHA}"
+          docker push "${IMAGE}:latest"
+
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:sha-${SHORT_SHA}" | cut -d@ -f2)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "✅ pushed ${IMAGE}:sha-${SHORT_SHA}"
+          echo "   digest ${DIGEST}"
+
+  # ── 3. deploy-dev（只有 main）──────────────────────────────────────────────
+  deploy-dev:
+    name: 3 deploy → dev
+    if: github.ref_type == 'branch'
+    needs: [verify, build-push]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: dev
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.DEV_PROJECT }}
+          workload_identity_provider: projects/${{ env.DEV_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.DEV_PROJECT }}.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: gcloud run deploy
+        id: deploy
+        env:
+          SERVICE: ${{ needs.verify.outputs.service }}
+          DIGEST: ${{ needs.build-push.outputs.digest }}
+          REGION: ${{ inputs.region }}
+          UNAUTH: ${{ inputs.allow_unauthenticated }}
+          ENV_NAME: dev
+          PROJECT: adamsourceinfo-dev
+        run: |
+          set -euo pipefail
+          IMAGE="${AR_HOST}/${PROJECT}/${AR_REPO}/${SERVICE}@${DIGEST}"
+
+          # ── 設定與機密 ────────────────────────────────────────────────
+          # .cicd/env.<env>      非機密設定，KEY=VALUE，進版控
+          # .cicd/secrets.<env>  只放 Secret Manager 的「名字」，KEY=secret-name:version
+          # 用 ^@^ 自訂分隔符，值裡面才可以出現逗號。
+          ENV_FILE=".cicd/env.${ENV_NAME}"
+          SEC_FILE=".cicd/secrets.${ENV_NAME}"
+
+          PAIRS="APP_ENV=${ENV_NAME}"
+          [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
+          if [ -f "$ENV_FILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ''|'#'*) continue;; esac
+              PAIRS="${PAIRS}@${line}"
+            done < "$ENV_FILE"
+            echo "已套用 $ENV_FILE"
+          fi
+
+          SEC_PAIRS=""
+          if [ -f "$SEC_FILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ''|'#'*) continue;; esac
+              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@}${line}"
+            done < "$SEC_FILE"
+            echo "已掛載 $SEC_FILE（只掛名字，值留在 Secret Manager）"
+          fi
+
+          ARGS=(
+            "$SERVICE"
+            --image="$IMAGE"
+            --region="$REGION"
+            --project="$PROJECT"
+            --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
+            --platform=managed
+            --quiet
+            "--set-env-vars=^@^${PAIRS}"
+          )
+          if [ -n "$SEC_PAIRS" ]; then
+            ARGS+=("--set-secrets=^@^${SEC_PAIRS}")
+          fi
+          if [ "$UNAUTH" = "true" ]; then
+            ARGS+=(--allow-unauthenticated)
+          else
+            ARGS+=(--no-allow-unauthenticated)
+          fi
+
+          gcloud run deploy "${ARGS[@]}"
+
+          URL=$(gcloud run services describe "$SERVICE" --region="$REGION" --project="$PROJECT" --format='value(status.url)')
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "✅ dev → ${URL}"
+
+  # ── 4. smoke-dev（只有 main）───────────────────────────────────────────────
+  smoke-dev:
+    name: 4 smoke dev
+    if: github.ref_type == 'branch'
+    needs: [verify, build-push, deploy-dev]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 健康檢查
+        env:
+          URL: ${{ needs.deploy-dev.outputs.url }}
+          HEALTH_PATH: ${{ inputs.health_path }}
+        run: |
+          set -euo pipefail
+          TARGET="${URL%/}${HEALTH_PATH}"
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$TARGET" || echo 000)
+            echo "attempt $i: HTTP $CODE  $TARGET"
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+              echo "✅ dev 健康檢查通過"
+              {
+                echo "### ✅ 部署到 dev"
+                echo ""
+                echo "| | |"
+                echo "|---|---|"
+                echo "| 服務 | \`${{ needs.verify.outputs.service }}\` |"
+                echo "| 環境 | \`adamsourceinfo-dev\` |"
+                echo "| commit | \`${{ needs.verify.outputs.short_sha }}\` |"
+                echo "| digest | \`${{ needs.build-push.outputs.digest }}\` |"
+                echo "| URL | ${URL} |"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::dev 健康檢查失敗（最後一次 HTTP $CODE，目標 $TARGET）。服務部署成功但沒有回應，請檢查應用程式是否有監聽 \$PORT。"
+          exit 1
+
+  # ── 5. resolve（只有 tag）──────────────────────────────────────────────────
+  # 由 tag 指向的 commit 反查 dev AR 裡對應的 digest。查不到代表這個 commit 沒走過
+  # main pipeline —— 擋下來，不要用重建的方式蒙混過去。
+  resolve:
+    name: 5 resolve digest
+    if: github.ref_type == 'tag'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.find.outputs.digest }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.DEV_PROJECT }}
+          workload_identity_provider: projects/${{ env.DEV_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.DEV_PROJECT }}.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: 反查 digest
+        id: find
+        env:
+          SERVICE: ${{ needs.verify.outputs.service }}
+          SHORT_SHA: ${{ needs.verify.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="${AR_HOST}/${DEV_PROJECT}/${AR_REPO}/${SERVICE}"
+
+          DIGEST=$(gcloud artifacts docker images describe "${IMAGE}:sha-${SHORT_SHA}" \
+            --format='value(image_summary.digest)' 2>/dev/null || true)
+
+          if [ -z "$DIGEST" ]; then
+            echo "::error::在 dev Artifact Registry 找不到 ${IMAGE}:sha-${SHORT_SHA}。"
+            echo "::error::這個 tag 指向的 commit 從來沒有經過 main pipeline 建置。prod 只部署 dev 驗證過的 image —— 請先讓 commit 進 main、等 dev 部署成功，再打 tag。"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "✅ 找到 dev image digest ${DIGEST}"
+
+  # ── 6. promote（只有 tag）─────────────────────────────────────────────────
+  # 把 dev AR 的同一個 digest 搬進 prod AR。兩個 AR 都在同一個 registry host，
+  # imagetools 走 cross-repo blob mount，不會真的重傳 layer。
+  promote:
+    name: 6 promote → prod AR
+    if: github.ref_type == 'tag'
+    needs: [verify, resolve]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      digest: ${{ steps.copy.outputs.digest }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.PROD_PROJECT }}
+          workload_identity_provider: projects/${{ env.PROD_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.PROD_PROJECT }}.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: docker 登入 Artifact Registry
+        run: gcloud auth configure-docker "${AR_HOST}" --quiet
+
+      - name: 複製 image 並比對 digest
+        id: copy
+        env:
+          SERVICE: ${{ needs.verify.outputs.service }}
+          SRC_DIGEST: ${{ needs.resolve.outputs.digest }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SRC="${AR_HOST}/${DEV_PROJECT}/${AR_REPO}/${SERVICE}@${SRC_DIGEST}"
+          DST="${AR_HOST}/${PROD_PROJECT}/${AR_REPO}/${SERVICE}"
+
+          docker buildx imagetools create --tag "${DST}:${TAG}" --tag "${DST}:latest" "$SRC"
+
+          NEW_DIGEST=$(gcloud artifacts docker images describe "${DST}:${TAG}" --format='value(image_summary.digest)')
+          if [ "$NEW_DIGEST" != "$SRC_DIGEST" ]; then
+            echo "::error::複製後 digest 不一致：來源 ${SRC_DIGEST} → 目的 ${NEW_DIGEST}。promote 的整個重點就是逐位元組相同，這裡不一致就必須中止。"
+            exit 1
+          fi
+          echo "digest=${NEW_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "✅ promote 完成，digest 一致：${NEW_DIGEST}"
+
+  # ── 7. deploy-prod（只有 tag）─────────────────────────────────────────────
+  deploy-prod:
+    name: 7 deploy → prod
+    if: github.ref_type == 'tag'
+    needs: [verify, promote]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment:
+      name: prod
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.PROD_PROJECT }}
+          workload_identity_provider: projects/${{ env.PROD_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.PROD_PROJECT }}.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: gcloud run deploy
+        id: deploy
+        env:
+          SERVICE: ${{ needs.verify.outputs.service }}
+          DIGEST: ${{ needs.promote.outputs.digest }}
+          REGION: ${{ inputs.region }}
+          UNAUTH: ${{ inputs.allow_unauthenticated }}
+          APP_VERSION: ${{ github.ref_name }}
+          ENV_NAME: prod
+          PROJECT: adamsourceinfo-prod
+        run: |
+          set -euo pipefail
+          IMAGE="${AR_HOST}/${PROJECT}/${AR_REPO}/${SERVICE}@${DIGEST}"
+
+          # ── 設定與機密 ────────────────────────────────────────────────
+          # .cicd/env.<env>      非機密設定，KEY=VALUE，進版控
+          # .cicd/secrets.<env>  只放 Secret Manager 的「名字」，KEY=secret-name:version
+          # 用 ^@^ 自訂分隔符，值裡面才可以出現逗號。
+          ENV_FILE=".cicd/env.${ENV_NAME}"
+          SEC_FILE=".cicd/secrets.${ENV_NAME}"
+
+          PAIRS="APP_ENV=${ENV_NAME}"
+          [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
+          if [ -f "$ENV_FILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ''|'#'*) continue;; esac
+              PAIRS="${PAIRS}@${line}"
+            done < "$ENV_FILE"
+            echo "已套用 $ENV_FILE"
+          fi
+
+          SEC_PAIRS=""
+          if [ -f "$SEC_FILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ''|'#'*) continue;; esac
+              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@}${line}"
+            done < "$SEC_FILE"
+            echo "已掛載 $SEC_FILE（只掛名字，值留在 Secret Manager）"
+          fi
+
+          ARGS=(
+            "$SERVICE"
+            --image="$IMAGE"
+            --region="$REGION"
+            --project="$PROJECT"
+            --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
+            --platform=managed
+            --quiet
+            "--set-env-vars=^@^${PAIRS}"
+          )
+          if [ -n "$SEC_PAIRS" ]; then
+            ARGS+=("--set-secrets=^@^${SEC_PAIRS}")
+          fi
+          if [ "$UNAUTH" = "true" ]; then
+            ARGS+=(--allow-unauthenticated)
+          else
+            ARGS+=(--no-allow-unauthenticated)
+          fi
+
+          gcloud run deploy "${ARGS[@]}"
+
+          URL=$(gcloud run services describe "$SERVICE" --region="$REGION" --project="$PROJECT" --format='value(status.url)')
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "✅ prod → ${URL}"
+
+  # ── 8. smoke-prod（只有 tag）──────────────────────────────────────────────
+  smoke-prod:
+    name: 8 smoke prod
+    if: github.ref_type == 'tag'
+    needs: [verify, resolve, promote, deploy-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 健康檢查
+        env:
+          URL: ${{ needs.deploy-prod.outputs.url }}
+          HEALTH_PATH: ${{ inputs.health_path }}
+        run: |
+          set -euo pipefail
+          TARGET="${URL%/}${HEALTH_PATH}"
+          for i in 1 2 3 4 5 6; do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$TARGET" || echo 000)
+            echo "attempt $i: HTTP $CODE  $TARGET"
+            if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
+              echo "✅ prod 健康檢查通過"
+              {
+                echo "### 🚀 發布到 prod"
+                echo ""
+                echo "| | |"
+                echo "|---|---|"
+                echo "| 服務 | \`${{ needs.verify.outputs.service }}\` |"
+                echo "| 版本 | \`${{ github.ref_name }}\` |"
+                echo "| 環境 | \`adamsourceinfo-prod\` |"
+                echo "| commit | \`${{ needs.verify.outputs.short_sha }}\` |"
+                echo "| digest | \`${{ needs.promote.outputs.digest }}\` |"
+                echo "| URL | ${URL} |"
+                echo ""
+                echo "此 digest 與 dev 驗證過的 image 完全相同（未重新 build）。"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::prod 健康檢查失敗（最後一次 HTTP $CODE，目標 $TARGET）。"
+          exit 1

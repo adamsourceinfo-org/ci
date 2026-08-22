@@ -1,0 +1,13 @@
+# 由 adamsourceinfo-org/ci 提供。PR 檢查，不碰 GCP。
+# 這支是 main 分支保護的 required status check。
+name: ci
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: adamsourceinfo-org/ci/.github/workflows/ci.yml@main
+    # with:
+    #   service: my-app
+    #   dockerfile: Dockerfile

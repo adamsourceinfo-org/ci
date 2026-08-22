@@ -1,0 +1,77 @@
+# PR 檢查。完全不碰 GCP、不推 image、不需要任何憑證。
+# 這支的用途是當 main 分支保護的 required status check：建不起來的東西進不了 main。
+name: ci (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: false
+        default: ""
+      dockerfile:
+        type: string
+        required: false
+        default: Dockerfile
+
+jobs:
+  verify:
+    name: 1 verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 檢查契約
+        env:
+          IN_SERVICE: ${{ inputs.service }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          SERVICE="${IN_SERVICE:-${GITHUB_REPOSITORY##*/}}"
+
+          if ! printf '%s' "$SERVICE" | grep -Eq '^[a-z]([-a-z0-9]*[a-z0-9])?$'; then
+            echo "::error::服務名稱 '$SERVICE' 不符合 Cloud Run 規則（小寫字母開頭，只能有小寫字母/數字/連字號）。"
+            exit 1
+          fi
+          if [ ${#SERVICE} -gt 49 ]; then
+            echo "::error::服務名稱 '$SERVICE' 超過 49 字元。"
+            exit 1
+          fi
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error::找不到 $DOCKERFILE。adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。"
+            exit 1
+          fi
+
+          for f in .cicd/env.dev .cicd/env.prod .cicd/secrets.dev .cicd/secrets.prod; do
+            [ -f "$f" ] || continue
+            if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*='; then
+              echo "::error::$f 有不合法的行。格式必須是 KEY=VALUE，一行一個。"
+              exit 1
+            fi
+          done
+
+          for f in .cicd/secrets.dev .cicd/secrets.prod; do
+            [ -f "$f" ] || continue
+            if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*=[a-z0-9-]+:(latest|[0-9]+)$'; then
+              echo "::error::$f 格式錯誤。這個檔案只能放 Secret Manager 的『名字』，不能放值："
+              echo "::error::  正確 → DB_PASSWORD=myapp-db-password-dev:latest"
+              echo "::error::  錯誤 → DB_PASSWORD=hunter2"
+              exit 1
+            fi
+          done
+
+          echo "✅ 契約檢查通過（service=$SERVICE）"
+
+  build:
+    name: 2 build
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build（不推）
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          docker build -f "$DOCKERFILE" -t ci-check:${GITHUB_SHA:0:7} .
+          echo "✅ image 建置成功"

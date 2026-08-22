@@ -286,7 +286,7 @@ jobs:
             fi
             sleep 10
           done
-          echo "::error::dev 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。服務部署成功但沒有回應，請檢查應用程式是否有監聽 \${PORT}。"
+          echo "::error::dev 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。服務部署成功但沒有回應，請檢查應用程式是否有監聽 \$PORT。"
           exit 1
 
   # ── 5. resolve（只有 tag）──────────────────────────────────────────────────

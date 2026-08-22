@@ -7,7 +7,7 @@ push main      → build → 推 dev Artifact Registry → 部署 adamsourceinfo
 push tag vX.Y.Z → 取 main 建好的同一個 digest → 搬進 prod AR → 部署 adamsourceinfo-prod
 ```
 
-**tag 永遠不重新 build。** prod 跑的 binary 逐位元組等於 dev 驗過的那一份。
+**tag 永遠不重新 build。** prod 跑的 binary 逐位元組等於 dev 驗過的那一份 —— promote 用 `crane copy`（不是 `docker buildx imagetools create`，後者會把來源 manifest 再包一層 index，digest 就變了），複製完還會比對 digest，不一致就中止。
 
 ---
 

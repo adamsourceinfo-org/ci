@@ -82,7 +82,7 @@ ok ".cicd/{env,secrets}.{dev,prod}"
 if [ ! -f Dockerfile ]; then
   cat > Dockerfile <<'EOF'
 # adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。
-# 容器必須監聽 ${PORT}（Cloud Run 會注入，預設 8080）。
+# 容器必須監聽 $PORT（Cloud Run 會注入，預設 8080）。
 FROM nginx:alpine
 RUN printf 'server { listen 8080; location / { return 200 "replace me\n"; } }' > /etc/nginx/conf.d/default.conf
 EXPOSE 8080
@@ -166,7 +166,7 @@ cat <<EOF
    main 保護：禁直推 / 禁 force push / 禁刪除 / 強制 PR + ci 通過
 
 接下來：
-   1. 換掉 Dockerfile 成你真正的應用（要監聽 \${PORT}）
+   1. 換掉 Dockerfile 成你真正的應用（要監聽 \$PORT）
    2. 開分支 → PR → merge 進 main，自動部署 dev
    3. git tag v0.1.0 && git push origin v0.1.0，發到 prod
 ────────────────────────────────────────────────────────────

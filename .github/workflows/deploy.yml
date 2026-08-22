@@ -353,8 +353,20 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: docker 登入 Artifact Registry
-        run: gcloud auth configure-docker "${AR_HOST}" --quiet
+      - name: 安裝 crane
+        env:
+          CRANE_VERSION: v0.20.2
+        run: |
+          set -euo pipefail
+          # 用 crane 而不是 docker buildx imagetools create —— 後者會把來源 manifest 再包
+          # 一層 index，digest 就變了。promote 的整個重點是 digest 原封不動，所以只能用
+          # 真正的 copy。
+          cd /tmp
+          curl -fsSL -o crane.tar.gz \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          tar -xzf crane.tar.gz crane
+          sudo mv crane /usr/local/bin/crane
+          crane version
 
       - name: 複製 image 並比對 digest
         id: copy
@@ -367,7 +379,11 @@ jobs:
           SRC="${AR_HOST}/${DEV_PROJECT}/${AR_REPO}/${SERVICE}@${SRC_DIGEST}"
           DST="${AR_HOST}/${PROD_PROJECT}/${AR_REPO}/${SERVICE}"
 
-          docker buildx imagetools create --tag "${DST}:${TAG}" --tag "${DST}:latest" "$SRC"
+          gcloud auth print-access-token \
+            | crane auth login -u oauth2accesstoken --password-stdin "${AR_HOST}"
+
+          crane copy "$SRC" "${DST}:${TAG}"
+          crane tag "${DST}:${TAG}" latest
 
           NEW_DIGEST=$(gcloud artifacts docker images describe "${DST}:${TAG}" --format='value(image_summary.digest)')
           if [ "$NEW_DIGEST" != "$SRC_DIGEST" ]; then

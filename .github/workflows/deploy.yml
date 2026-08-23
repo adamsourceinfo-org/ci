@@ -231,7 +231,7 @@ jobs:
   # 任何雲端憑證。合併 ci.yml 進來之後，這條界線只剩下面這個 if: 和缺席的 permissions
   # 在守，所以它們是安全邊界的一部分，不是風格。
   build:
-    name: 2 build（PR）
+    name: 2 build
     if: github.event_name == 'pull_request'
     needs: verify
     runs-on: ubuntu-latest

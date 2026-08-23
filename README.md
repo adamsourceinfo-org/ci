@@ -102,18 +102,46 @@ gcloud artifacts repositories add-iam-policy-binding apps \
 ## 開一個新專案
 
 ```bash
-gh repo create adamsourceinfo-org/my-app --public --clone
-mkdir -p my-app/.github/workflows my-app/.cicd
-curl -sL https://raw.githubusercontent.com/adamsourceinfo-org/ci/main/templates/deploy.yml \
-  -o my-app/.github/workflows/deploy.yml
-curl -sL https://raw.githubusercontent.com/adamsourceinfo-org/ci/main/templates/config.yml \
-  -o my-app/.cicd/config.yml
+gh repo create adamsourceinfo-org/my-app --public --clone && cd my-app
+mkdir -p .github/workflows .cicd
+
+cat > .github/workflows/deploy.yml <<'YAML'
+# 由 adamsourceinfo-org/ci 提供。部署邏輯全部在 ci repo，這裡只負責呼叫它。
+#
+# 改這個檔不會讓你拿到任何 GCP 權限 —— 換取雲端憑證的條件綁死在
+# "adamsourceinfo-org/ci/.github/workflows/deploy.yml@refs/heads/main"。
+#
+# 三條路：
+#   PR          → 只 build，證明建得起來（完全不碰 GCP）
+#   push main   → build → 部署 adamsourceinfo-dev
+#   push tag    → 把 main 建好的同一個 image 搬去 adamsourceinfo-prod（不重新 build）
+name: deploy
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    # 刻意收「所有」tag 再由 ci 驗格式。用 glob 過濾的話，推一個格式不對的 tag
+    # 會安靜地什麼都不發生 —— 而「按了沒反應」比紅燈難查得多。
+    tags: ["**"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write      # 換 WIF 憑證必要
+    uses: adamsourceinfo-org/ci/.github/workflows/deploy.yml@main
+    # 專案設定放 .cicd/config.yml，這支 stub 不用改。
+YAML
 ```
 
 再自備 `Dockerfile`（容器要監聽 `$PORT`），推上 main 就會部署 dev。
 
+`.cicd/` 全部選填 —— 什麼都不放也能跑，格式見下面「專案端契約」。
+
 **分支保護是 repo 自己的治理設定，不是這裡的事。** 在 GitHub 介面或 org ruleset 設定即可；
-required check 用 `deploy / 2 build`。
+required check 用 `deploy / 1 verify` 與 `deploy / 2 build`。
 
 > Free 方案的分支保護只對 public repo 有效。要 private + 保護得升級 GitHub Team。
 

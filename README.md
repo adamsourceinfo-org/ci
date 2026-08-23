@@ -136,7 +136,14 @@ jobs:
 YAML
 ```
 
-再自備 `Dockerfile`（容器要監聽 `$PORT`），推上 main 就會部署 dev。
+再自備 `Dockerfile`（容器要監聽 `$PORT`），然後推上去：
+
+```bash
+git add -A && git commit -m "接上 adamsourceinfo-org/ci"
+git branch -M main && git push -u origin main
+```
+
+`gh repo create` 出來的 repo 是空的（沒有 commit、沒有 main 分支），所以 `-M main` 不能省。
 
 `.cicd/` 全部選填 —— 什麼都不放也能跑，格式見下面「專案端契約」。
 
@@ -335,6 +342,14 @@ SQL
 
 > `--token` 不是多餘的：本機 ADC 過期時 proxy 會噴 `invalid_grant / invalid_rapt`，
 > 但 gcloud CLI 自己的憑證通常還好好的。
+
+開通完成後**要重新觸發一次部署**——先前那次已經失敗，不會自己重跑：
+
+```bash
+gh workflow run deploy.yml --repo adamsourceinfo-org/my-app --ref main
+```
+
+（不要用 `gh run rerun`：它會沿用當初解析到的 ci workflow 版本。）
 
 dev 不用時可停機，只算儲存費：
 

@@ -60,6 +60,31 @@ jobs:
             fi
           done
 
+          # INSTANCE_CONNECTION_NAME / DB_USER 由 CI 依部署環境推導後注入。手寫的話會跟
+          # 注入值一起進 --update-env-vars，同名 key 誰贏未定義。deploy 的 verify 也有
+          # 同一份檢查，但那要等併進 main 才會跑 —— 開發者要的是 PR 上就看到紅燈。
+          for E in dev prod; do
+            F=".cicd/env.${E}"
+            [ -f "$F" ] || continue
+            for KEY in INSTANCE_CONNECTION_NAME DB_USER; do
+              if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
+                echo "::error::${F} 不可以自己設定 ${KEY} —— 這個值由 CI 依部署目標推導。"
+                echo "::error::請改成宣告 DB_INSTANCE=<instance 名稱>，CI 會組出 <專案>:<區域>:<instance>。"
+                exit 1
+              fi
+            done
+          done
+
+          # 只有一邊宣告 DB_INSTANCE 是合法的漸進上線，警告但不擋。
+          db_declared() {
+            [ -f ".cicd/env.$1" ] && grep -Eq '^[[:space:]]*DB_INSTANCE=' ".cicd/env.$1"
+          }
+          if db_declared dev && ! db_declared prod; then
+            echo "::warning::.cicd/env.dev 宣告了 DB_INSTANCE 但 .cicd/env.prod 沒有 —— prod 不會掛載 Cloud SQL。"
+          elif db_declared prod && ! db_declared dev; then
+            echo "::warning::.cicd/env.prod 宣告了 DB_INSTANCE 但 .cicd/env.dev 沒有 —— dev 不會掛載 Cloud SQL。"
+          fi
+
           echo "✅ 契約檢查通過（service=${SERVICE}）"
 
   build:

@@ -76,10 +76,10 @@ jobs:
         id: contract
         env:
           IN_SERVICE: ${{ inputs.service }}
-          IN_REGION: ${{ needs.verify.outputs.region }}
-          IN_HEALTH_PATH: ${{ needs.verify.outputs.health_path }}
-          IN_DOCKERFILE: ${{ needs.verify.outputs.dockerfile }}
-          IN_UNAUTH: ${{ needs.verify.outputs.allow_unauthenticated }}
+          IN_REGION: ${{ inputs.region }}
+          IN_HEALTH_PATH: ${{ inputs.health_path }}
+          IN_DOCKERFILE: ${{ inputs.dockerfile }}
+          IN_UNAUTH: ${{ inputs.allow_unauthenticated }}
         run: |
           set -euo pipefail
 

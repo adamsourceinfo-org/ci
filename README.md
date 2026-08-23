@@ -171,7 +171,7 @@ conn = pg8000.dbapi.connect(
 
 ```bash
 PROJECT=adamsourceinfo-dev; INSTANCE=my-app-pg; DB=my_app
-SA="run-runtime@${PROJECT}.iam.gserviceaccount.com"
+SA="run-runtime@${PROJECT}.iam.gserviceaccount.com"   # IAM 綁定用全名
 
 # --edition=ENTERPRISE 不能省：新 instance 預設 ENTERPRISE_PLUS，那個版本不收
 # db-f1-micro 這類共享核心規格，會噴 Invalid Tier 並要你改用 db-perf-optimized-N-*。
@@ -182,8 +182,10 @@ gcloud sql instances create "$INSTANCE" --project="$PROJECT" --region=asia-east1
 
 gcloud sql databases create "$DB" --instance="$INSTANCE" --project="$PROJECT"
 
-gcloud sql users create "$SA" --instance="$INSTANCE" --project="$PROJECT" \
-  --type=cloud_iam_service_account
+# 注意：IAM 使用者要用「去掉 .gserviceaccount.com」的短格式，否則 API 會回 400。
+# 這個短格式正好就是 CI 注入的 DB_USER，兩邊必須逐字相同。
+gcloud sql users create "run-runtime@${PROJECT}.iam" --instance="$INSTANCE" \
+  --project="$PROJECT" --type=cloud_iam_service_account
 
 for ROLE in roles/cloudsql.client roles/cloudsql.instanceUser; do
   gcloud projects add-iam-policy-binding "$PROJECT" \
@@ -191,11 +193,23 @@ for ROLE in roles/cloudsql.client roles/cloudsql.instanceUser; do
 done
 ```
 
-最後進 DB 授權（IAM 使用者建好後仍需要 `GRANT`）：
+最後進 DB 授權。Postgres 15 之後 `public` schema 不再預設給 PUBLIC 建表權，
+所以建完 IAM 使用者**還是要 `GRANT`**，否則 app 連得上但一建表就 permission denied：
 
-```sql
-GRANT ALL ON SCHEMA public TO "run-runtime@<專案>.iam";
+```bash
+# 一定要連進「目標 database」下 GRANT —— 每個 database 有自己的 public schema，
+# 連到預設的 postgres 庫下的話會成功但完全沒作用。
+cloud-sql-proxy "${PROJECT}:asia-east1:${INSTANCE}" --port 5433 \
+  --token "$(gcloud auth print-access-token)" &
+
+PGPASSWORD=<postgres 密碼> psql -h 127.0.0.1 -p 5433 -U postgres -d "$DB" <<SQL
+GRANT ALL ON SCHEMA public TO "run-runtime@${PROJECT}.iam";
+GRANT ALL PRIVILEGES ON DATABASE ${DB} TO "run-runtime@${PROJECT}.iam";
+SQL
 ```
+
+> `--token` 那段不是多餘的：本機 ADC 過期時 proxy 會噴 `invalid_grant / invalid_rapt`，
+> 但 gcloud CLI 自己的憑證通常還好好的，直接餵 token 就不用重跑 ADC 登入。
 
 dev 不用的時候可以停機，只算儲存費：
 
@@ -264,6 +278,9 @@ Cloud Run 用專屬的 `run-runtime` 執行，不用 default compute SA（那個
 | `不可以自己設定 INSTANCE_CONNECTION_NAME` | 這是 CI 保留字。改宣告 `DB_INSTANCE=<instance 名稱>` |
 | `Bad syntax for dict arg` | `.cicd/env.*` 的值裡有 `@@`，撞到自訂分隔符 |
 | 部署時 `Aborted by user` | 該專案的 `sqladmin.googleapis.com` 沒開。跑 `bootstrap-gcp.sh` |
-| DB 連線 `password authentication failed` | IAM 使用者建了但沒 `GRANT`，或 access token 過期了 |
+| DB 連線 `permission denied for schema public` | IAM 使用者建了但沒 `GRANT`，或 `GRANT` 下在別的 database |
+| `Database username ... should be created without \".gserviceaccount.com\" suffix` | `gcloud sql users create` 要用短格式 `run-runtime@<專案>.iam` |
+| `Invalid Tier (db-f1-micro) for (ENTERPRISE_PLUS) Edition` | 建 instance 要加 `--edition=ENTERPRISE` |
+| proxy `invalid_grant / invalid_rapt` | 本機 ADC 過期。加 `--token "$(gcloud auth print-access-token)"` |
 
 <!-- self-test 驗證用 -->

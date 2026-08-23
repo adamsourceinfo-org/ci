@@ -93,6 +93,40 @@ jobs:
           echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
           echo "✅ service=$SERVICE  dockerfile=$DOCKERFILE  sha=${GITHUB_SHA:0:7}"
 
+      - name: 檢查 .cicd 設定契約
+        run: |
+          set -euo pipefail
+
+          # INSTANCE_CONNECTION_NAME / DB_USER 由 CI 依「正在部署哪個環境」推導後注入。
+          # 開發者手寫的話會跟注入值一起進 --update-env-vars，同名 key 誰贏未定義 ——
+          # 擋下來比安靜地不確定好。
+          for E in dev prod; do
+            F=".cicd/env.${E}"
+            [ -f "$F" ] || continue
+            for KEY in INSTANCE_CONNECTION_NAME DB_USER; do
+              if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
+                echo "::error::${F} 不可以自己設定 ${KEY} —— 這個值由 CI 依部署目標推導。"
+                echo "::error::請改成宣告 DB_INSTANCE=<instance 名稱>，CI 會組出 <專案>:<區域>:<instance>。"
+                exit 1
+              fi
+            done
+          done
+
+          # 只有一邊宣告 DB_INSTANCE 是合法的漸進上線（先在 dev 接上驗證再開 prod），
+          # 所以只警告不擋。靜靜放過的話「忘了開 prod」會拖到 runtime 才炸。
+          db_declared() {
+            [ -f ".cicd/env.$1" ] && grep -Eq '^[[:space:]]*DB_INSTANCE=' ".cicd/env.$1"
+          }
+          if db_declared dev && ! db_declared prod; then
+            echo "::warning::.cicd/env.dev 宣告了 DB_INSTANCE 但 .cicd/env.prod 沒有 —— prod 不會掛載 Cloud SQL。"
+            echo "⚠️ dev 宣告了 DB_INSTANCE，prod 沒有" >> "$GITHUB_STEP_SUMMARY"
+          elif db_declared prod && ! db_declared dev; then
+            echo "::warning::.cicd/env.prod 宣告了 DB_INSTANCE 但 .cicd/env.dev 沒有 —— dev 不會掛載 Cloud SQL。"
+            echo "⚠️ prod 宣告了 DB_INSTANCE，dev 沒有" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "✅ .cicd 設定契約檢查通過"
+
       - name: 驗證 tag（僅 tag 觸發）
         if: github.ref_type == 'tag'
         run: |
@@ -207,7 +241,7 @@ jobs:
           # ── 設定與機密 ────────────────────────────────────────────────
           # .cicd/env.<env>      非機密設定，KEY=VALUE，進版控
           # .cicd/secrets.<env>  只放 Secret Manager 的「名字」，KEY=secret-name:version
-          # 用 ^@^ 自訂分隔符，值裡面才可以出現逗號。
+          # 用 ^@@^ 自訂分隔符，值裡面才可以出現逗號與 @（DB_USER 就含 @）。
           ENV_FILE=".cicd/env.${ENV_NAME}"
           SEC_FILE=".cicd/secrets.${ENV_NAME}"
 
@@ -217,20 +251,32 @@ jobs:
           # 代價：從 .cicd/env.<env> 刪掉一行，Cloud Run 上那個變數不會自動消失，
           # 要手動移除：gcloud run services update <svc> --remove-env-vars=KEY
           PAIRS="APP_ENV=${ENV_NAME}"
-          [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
+          [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@@APP_VERSION=${APP_VERSION}"
           if [ -f "$ENV_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
-              PAIRS="${PAIRS}@${line}"
+              case "$line" in DB_INSTANCE=*) DB_INSTANCE="${line#DB_INSTANCE=}";; esac
+              PAIRS="${PAIRS}@@${line}"
             done < "$ENV_FILE"
             echo "已套用 ${ENV_FILE}（合併模式，不會刪除既有變數）"
+          fi
+
+          # ── Cloud SQL ────────────────────────────────────────────────
+          # 宣告 DB_INSTANCE 才啟用；沒宣告的服務行為與本功能不存在時逐字相同。
+          # 連線字串與 DB 帳號一律由 CI 從「正在部署哪個環境」推導 —— 開發者沒有地方
+          # 可以寫錯專案，兩個 .cicd/env.<env> 的 DB 設定逐字相同。
+          # 前提：Cloud SQL 與 Cloud Run 同區域。跨區/跨專案請手動掛載（--add 是疊加的）。
+          if [ -n "${DB_INSTANCE:-}" ]; then
+            ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+            PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
+            echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
           fi
 
           SEC_PAIRS=""
           if [ -f "$SEC_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
-              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@}${line}"
+              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@@}${line}"
             done < "$SEC_FILE"
             echo "已掛載 ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
           fi
@@ -243,10 +289,13 @@ jobs:
             --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
-            "--update-env-vars=^@^${PAIRS}"
+            "--update-env-vars=^@@^${PAIRS}"
           )
           if [ -n "$SEC_PAIRS" ]; then
-            ARGS+=("--update-secrets=^@^${SEC_PAIRS}")
+            ARGS+=("--update-secrets=^@@^${SEC_PAIRS}")
+          fi
+          if [ -n "${ICN:-}" ]; then
+            ARGS+=("--add-cloudsql-instances=${ICN}")
           fi
           if [ "$UNAUTH" = "true" ]; then
             ARGS+=(--allow-unauthenticated)
@@ -458,7 +507,7 @@ jobs:
           # ── 設定與機密 ────────────────────────────────────────────────
           # .cicd/env.<env>      非機密設定，KEY=VALUE，進版控
           # .cicd/secrets.<env>  只放 Secret Manager 的「名字」，KEY=secret-name:version
-          # 用 ^@^ 自訂分隔符，值裡面才可以出現逗號。
+          # 用 ^@@^ 自訂分隔符，值裡面才可以出現逗號與 @（DB_USER 就含 @）。
           ENV_FILE=".cicd/env.${ENV_NAME}"
           SEC_FILE=".cicd/secrets.${ENV_NAME}"
 
@@ -468,20 +517,32 @@ jobs:
           # 代價：從 .cicd/env.<env> 刪掉一行，Cloud Run 上那個變數不會自動消失，
           # 要手動移除：gcloud run services update <svc> --remove-env-vars=KEY
           PAIRS="APP_ENV=${ENV_NAME}"
-          [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
+          [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@@APP_VERSION=${APP_VERSION}"
           if [ -f "$ENV_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
-              PAIRS="${PAIRS}@${line}"
+              case "$line" in DB_INSTANCE=*) DB_INSTANCE="${line#DB_INSTANCE=}";; esac
+              PAIRS="${PAIRS}@@${line}"
             done < "$ENV_FILE"
             echo "已套用 ${ENV_FILE}（合併模式，不會刪除既有變數）"
+          fi
+
+          # ── Cloud SQL ────────────────────────────────────────────────
+          # 宣告 DB_INSTANCE 才啟用；沒宣告的服務行為與本功能不存在時逐字相同。
+          # 連線字串與 DB 帳號一律由 CI 從「正在部署哪個環境」推導 —— 開發者沒有地方
+          # 可以寫錯專案，兩個 .cicd/env.<env> 的 DB 設定逐字相同。
+          # 前提：Cloud SQL 與 Cloud Run 同區域。跨區/跨專案請手動掛載（--add 是疊加的）。
+          if [ -n "${DB_INSTANCE:-}" ]; then
+            ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+            PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
+            echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
           fi
 
           SEC_PAIRS=""
           if [ -f "$SEC_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
-              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@}${line}"
+              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@@}${line}"
             done < "$SEC_FILE"
             echo "已掛載 ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
           fi
@@ -494,10 +555,13 @@ jobs:
             --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
-            "--update-env-vars=^@^${PAIRS}"
+            "--update-env-vars=^@@^${PAIRS}"
           )
           if [ -n "$SEC_PAIRS" ]; then
-            ARGS+=("--update-secrets=^@^${SEC_PAIRS}")
+            ARGS+=("--update-secrets=^@@^${SEC_PAIRS}")
+          fi
+          if [ -n "${ICN:-}" ]; then
+            ARGS+=("--add-cloudsql-instances=${ICN}")
           fi
           if [ "$UNAUTH" = "true" ]; then
             ARGS+=(--allow-unauthenticated)

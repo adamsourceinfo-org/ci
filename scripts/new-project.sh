@@ -68,13 +68,21 @@ for E in dev prod; do
 # 機密請放 .cicd/secrets.${E}，值寫在 Secret Manager。
 # 範例：
 # LOG_LEVEL=$([ "$E" = dev ] && echo debug || echo info)
+#
+# 要用 Cloud SQL 的話，加下面兩行 —— dev 與 prod 兩個檔案「內容完全一樣」。
+# 連線字串與 DB 帳號由 CI 依部署環境推導，所以這裡沒有寫錯環境的餘地。
+# （INSTANCE_CONNECTION_NAME 與 DB_USER 是 CI 保留字，手寫會被 verify 擋下。）
+# DB_INSTANCE=${NAME}-pg
+# DB_NAME=$(printf '%s' "$NAME" | tr - _)
 EOF
   [ -f ".cicd/secrets.$E" ] || cat > ".cicd/secrets.$E" <<EOF
 # ${E} 環境的機密「掛載表」。這個檔案只放名字，絕對不要放值。
 # 格式：環境變數名=SecretManager名稱:版本
 # 先跑：ci/scripts/set-secret.sh ${E} <secret-name>
 # 再加：
-# DB_PASSWORD=${NAME}-db-password-${E}:latest
+# API_KEY=${NAME}-api-key-${E}:latest
+#
+# 注意：走 Cloud SQL IAM 資料庫認證的話沒有 DB 密碼可放 —— 見 ci/README.md「服務要用資料庫」。
 EOF
 done
 ok ".cicd/{env,secrets}.{dev,prod}"

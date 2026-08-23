@@ -97,7 +97,8 @@ echo 'DB_PASSWORD=my-app-db-password:latest' >> .cicd/secrets.prod
 
 改設定 = 改檔案 + PR，有版控有 review。改機密 = 跑一次腳本，不用動 code、不用重 build。
 
-> `.cicd/env.*` 與 `.cicd/secrets.*` 的值可以含逗號 — 部署時用 `^@^` 自訂分隔符。
+> `.cicd/env.*` 與 `.cicd/secrets.*` 的值可以含逗號與 `@` — 部署時用 `^@@^` 自訂分隔符。
+> （單字元的 `^@^` 碰到值裡有 `@` 會噴 `Bad syntax for dict arg`。`DB_USER=run-runtime@…` 正好含 `@`。）
 
 ### CI 永遠不覆蓋你的設定
 
@@ -117,6 +118,100 @@ gcloud run services update <服務> --region=asia-east1 --project=<專案> --rem
 ```
 
 （實測驗證過：手動設 `min=1`、`concurrency=40`、`memory=1Gi`，連續兩次 CI 部署後三個值都還在。）
+
+---
+
+## 服務要用資料庫
+
+在**兩個** `.cicd/env.<env>` 各加兩行，**內容完全一樣**：
+
+```
+DB_INSTANCE=my-app-pg
+DB_NAME=my_app
+```
+
+就這樣。連線字串、DB 帳號、Cloud SQL 掛載，CI 依「正在部署哪個環境」自己推導：
+
+| CI 注入的環境變數 | 推導方式 | dev 實際拿到 |
+|---|---|---|
+| `INSTANCE_CONNECTION_NAME` | `<專案>:<區域>:<DB_INSTANCE>` | `adamsourceinfo-dev:asia-east1:my-app-pg` |
+| `DB_USER` | `run-runtime@<專案>.iam` | `run-runtime@adamsourceinfo-dev.iam` |
+
+外加部署時掛上 `--add-cloudsql-instances`。
+
+**為什麼不讓你自己寫連線字串**：因為那樣就有寫錯專案的機會。CI 本來就知道自己在部署哪個環境（它已經用這個知識注入 `APP_ENV`），讓它一併推導，dev 連到 prod 的 DB 就從「會被抓到的錯」變成**寫不出來的錯**。兩個 env 檔那兩行逐字相同，diff 沒有差異，連抄錯都不可能。
+
+> `INSTANCE_CONNECTION_NAME` 與 `DB_USER` 是 CI 保留字。在 `.cicd/env.*` 手寫會被 `verify` 擋下。
+
+### 沒有密碼
+
+用 Cloud SQL **IAM 資料庫認證**：`run-runtime` SA 直接就是 Postgres 使用者，密碼是向 metadata server 要的 access token。Secret Manager 不用放任何 DB 機密，跟 WIF「一把金鑰都不存」是同一套邏輯。
+
+app 端這樣連（Python + pg8000，走 Cloud Run 注入的 unix socket）：
+
+```python
+import os, json, urllib.request, pg8000.dbapi
+
+def _token():
+    req = urllib.request.Request(
+        "http://metadata.google.internal/computeMetadata/v1/"
+        "instance/service-accounts/default/token",
+        headers={"Metadata-Flavor": "Google"})
+    return json.load(urllib.request.urlopen(req, timeout=5))["access_token"]
+
+conn = pg8000.dbapi.connect(
+    user=os.environ["DB_USER"],
+    password=_token(),                 # access token 當密碼，會過期，別快取太久
+    database=os.environ["DB_NAME"],
+    unix_sock=f"/cloudsql/{os.environ['INSTANCE_CONNECTION_NAME']}/.s.PGSQL.5432",
+)
+```
+
+### 一次性開通（還沒自動化）
+
+```bash
+PROJECT=adamsourceinfo-dev; INSTANCE=my-app-pg; DB=my_app
+SA="run-runtime@${PROJECT}.iam.gserviceaccount.com"
+
+# --edition=ENTERPRISE 不能省：新 instance 預設 ENTERPRISE_PLUS，那個版本不收
+# db-f1-micro 這類共享核心規格，會噴 Invalid Tier 並要你改用 db-perf-optimized-N-*。
+gcloud sql instances create "$INSTANCE" --project="$PROJECT" --region=asia-east1 \
+  --edition=ENTERPRISE --database-version=POSTGRES_17 --tier=db-f1-micro \
+  --storage-size=10 --storage-type=HDD \
+  --database-flags=cloudsql.iam_authentication=on --quiet
+
+gcloud sql databases create "$DB" --instance="$INSTANCE" --project="$PROJECT"
+
+gcloud sql users create "$SA" --instance="$INSTANCE" --project="$PROJECT" \
+  --type=cloud_iam_service_account
+
+for ROLE in roles/cloudsql.client roles/cloudsql.instanceUser; do
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:${SA}" --role="$ROLE" --condition=None --quiet
+done
+```
+
+最後進 DB 授權（IAM 使用者建好後仍需要 `GRANT`）：
+
+```sql
+GRANT ALL ON SCHEMA public TO "run-runtime@<專案>.iam";
+```
+
+dev 不用的時候可以停機，只算儲存費：
+
+```bash
+gcloud sql instances patch my-app-pg --project=adamsourceinfo-dev --activation-policy=NEVER   # 停
+gcloud sql instances patch my-app-pg --project=adamsourceinfo-dev --activation-policy=ALWAYS  # 開
+```
+
+### 限制
+
+| 限制 | 說明 |
+|---|---|
+| DB 與 Cloud Run 必須同區域 | 推導假設 `<專案>:asia-east1:<instance>` |
+| 不支援跨專案 / 跨區域的 DB | 真的需要就手動 `gcloud run services update --add-cloudsql-instances`，疊加式旗標與 CI 並存不衝突 |
+| 只有一邊宣告 `DB_INSTANCE` | `verify` 警告但不擋 —— 「先在 dev 接上驗證再開 prod」是合法的漸進上線 |
+| 刪掉 `DB_INSTANCE` | ⚠️ 掛載不會自動消失，要手動 `--remove-cloudsql-instances`（與環境變數同一個取捨） |
 
 ---
 
@@ -166,5 +261,9 @@ Cloud Run 用專屬的 `run-runtime` 執行，不用 default compute SA（那個
 | `在 dev AR 找不到 sha-xxxxxxx` | 這個 commit 沒走過 main pipeline。先讓它進 main、dev 部署成功再打 tag |
 | `複製後 digest 不一致` | promote 的重點就是逐位元組相同，不一致必須中止 |
 | dev 健康檢查失敗 | 容器沒監聽 `$PORT`（Cloud Run 注入，預設 8080） |
+| `不可以自己設定 INSTANCE_CONNECTION_NAME` | 這是 CI 保留字。改宣告 `DB_INSTANCE=<instance 名稱>` |
+| `Bad syntax for dict arg` | `.cicd/env.*` 的值裡有 `@@`，撞到自訂分隔符 |
+| 部署時 `Aborted by user` | 該專案的 `sqladmin.googleapis.com` 沒開。跑 `bootstrap-gcp.sh` |
+| DB 連線 `password authentication failed` | IAM 使用者建了但沒 `GRANT`，或 access token 過期了 |
 
 <!-- self-test 驗證用 -->

@@ -54,10 +54,13 @@ bootstrap_project() {
   fi
   ok "帳單已連結"
 
+  # sqladmin 一定要開，即使這個專案還沒有任何 Cloud SQL：部署帶 --add-cloudsql-instances
+  # 時 gcloud 會要求它已啟用，在 CI 的 --quiet 下會直接「Aborted by user」而不是問你。
   gcloud services enable \
     run.googleapis.com artifactregistry.googleapis.com \
     iamcredentials.googleapis.com sts.googleapis.com \
     secretmanager.googleapis.com cloudresourcemanager.googleapis.com \
+    sqladmin.googleapis.com \
     --project="$PROJECT" --quiet
   ok "API 已開通"
 

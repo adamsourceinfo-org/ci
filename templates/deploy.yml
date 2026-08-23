@@ -21,11 +21,5 @@ jobs:
       contents: read
       id-token: write
     uses: adamsourceinfo-org/ci/.github/workflows/deploy.yml@main
-    with:
-      # 全部選填。service 預設用 repo 名稱。
-      # service: my-app
-      # region: asia-east1
-      # health_path: /healthz
-      # dockerfile: Dockerfile
-      # allow_unauthenticated: true
-      health_path: /
+    # 專案設定放 .cicd/config.yml，這支 stub 不用改。
+    # （with: 的參數仍然可用，但 config.yml 的值會蓋過它。）

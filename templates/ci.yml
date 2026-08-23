@@ -8,6 +8,4 @@ on:
 jobs:
   ci:
     uses: adamsourceinfo-org/ci/.github/workflows/ci.yml@main
-    # with:
-    #   service: my-app
-    #   dockerfile: Dockerfile
+    # 專案設定放 .cicd/config.yml，這支 stub 不用改。

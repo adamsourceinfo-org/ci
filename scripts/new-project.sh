@@ -62,6 +62,21 @@ cp "$CI_DIR/templates/deploy.yml" .github/workflows/deploy.yml
 cp "$CI_DIR/templates/ci.yml"     .github/workflows/ci.yml
 ok ".github/workflows/{deploy,ci}.yml"
 
+if [ ! -f .cicd/config.yml ]; then
+  sed "s/my-app/${NAME}/g; s/my_app/$(printf '%s' "$NAME" | tr - _)/g" \
+    "$CI_DIR/templates/config.yml" > .cicd/config.yml
+  ok ".cicd/config.yml（結構性設定：service / region / db…）"
+fi
+
+for F in env secrets; do
+  [ -f ".cicd/${F}.common" ] || cat > ".cicd/${F}.common" <<EOF
+# dev 與 prod 共用的$([ "$F" = env ] && echo "非機密設定" || echo "機密掛載")。
+# 兩個環境一樣的東西寫這裡就好，不用在 ${F}.dev 跟 ${F}.prod 各抄一遍。
+# 同名的 key 會被 ${F}.<env> 覆蓋。
+EOF
+done
+ok ".cicd/{env,secrets}.common"
+
 for E in dev prod; do
   [ -f ".cicd/env.$E" ] || cat > ".cicd/env.$E" <<EOF
 # ${E} 環境的「非機密」設定。一行一個 KEY=VALUE，會進版控。
@@ -69,11 +84,8 @@ for E in dev prod; do
 # 範例：
 # LOG_LEVEL=$([ "$E" = dev ] && echo debug || echo info)
 #
-# 要用 Cloud SQL 的話，加下面兩行 —— dev 與 prod 兩個檔案「內容完全一樣」。
-# 連線字串與 DB 帳號由 CI 依部署環境推導，所以這裡沒有寫錯環境的餘地。
-# （INSTANCE_CONNECTION_NAME 與 DB_USER 是 CI 保留字，手寫會被 verify 擋下。）
-# DB_INSTANCE=${NAME}-pg
-# DB_NAME=$(printf '%s' "$NAME" | tr - _)
+# 兩個環境共用的值請放 .cicd/env.common，不要在這裡抄兩遍。
+# Cloud SQL 請在 .cicd/config.yml 的 db: 宣告（只宣告一次）。
 EOF
   [ -f ".cicd/secrets.$E" ] || cat > ".cicd/secrets.$E" <<EOF
 # ${E} 環境的機密「掛載表」。這個檔案只放名字，絕對不要放值。

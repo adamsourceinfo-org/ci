@@ -18,16 +18,62 @@ jobs:
   verify:
     name: 1 verify
     runs-on: ubuntu-latest
+    outputs:
+      dockerfile: ${{ steps.contract.outputs.dockerfile }}
     steps:
       - uses: actions/checkout@v4
 
       - name: 檢查契約
+        id: contract
         env:
           IN_SERVICE: ${{ inputs.service }}
-          DOCKERFILE: ${{ inputs.dockerfile }}
+          IN_DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           set -euo pipefail
-          SERVICE="${IN_SERVICE:-${GITHUB_REPOSITORY##*/}}"
+
+          # .cicd/config.yml 是專案的結構性設定；沒有這個檔就退回 stub 的 with: 參數。
+          # 這裡的檢查跟 deploy.yml 的 verify 是同一份 —— 差別只在這支在 PR 上就會跑，
+          # 開發者不用等併進 main 才看到紅燈。
+          CFG=".cicd/config.yml"
+          if [ -f "$CFG" ]; then
+            command -v yq >/dev/null || { echo "::error::runner 沒有 yq，無法解析 ${CFG}"; exit 1; }
+            yq -e 'type == "!!map"' "$CFG" >/dev/null 2>&1 || {
+              echo "::error::${CFG} 必須是 YAML mapping（key: value）。"; exit 1; }
+
+            ALLOWED="service region health_path dockerfile allow_unauthenticated db"
+            for K in $(yq -r 'keys | .[]' "$CFG"); do
+              case " $ALLOWED " in
+                *" $K "*) ;;
+                *) echo "::error::${CFG} 有不認得的設定 '${K}'。可用的是：${ALLOWED}"; exit 1 ;;
+              esac
+            done
+            for K in $(yq -r '.db // {} | keys | .[]' "$CFG"); do
+              case "$K" in
+                instance|name) ;;
+                *) echo "::error::${CFG} 的 db 底下有不認得的設定 '${K}'。可用的是：instance name"; exit 1 ;;
+              esac
+            done
+            DBI="$(yq -r '.db.instance' "$CFG")"; [ "$DBI" = "null" ] && DBI=""
+            DBN="$(yq -r '.db.name' "$CFG")"; [ "$DBN" = "null" ] && DBN=""
+            if [ -n "$DBI" ] && [ -z "$DBN" ]; then
+              echo "::error::${CFG} 宣告了 db.instance 就必須一併給 db.name。"; exit 1
+            fi
+          fi
+
+          cfg() {
+            local v=""
+            if [ -f "$CFG" ]; then
+              # 刻意不用 yq 的 // 運算子：它把 false 也當成「空值」，
+              # allow_unauthenticated: false 會被吃掉、退回預設的 true —— 服務靜靜變公開。
+              # 不吞錯誤：yq 失敗代表 config.yml 有問題，要大聲停下來，不是退回預設值。
+              v="$(yq -r "$1" "$CFG")"
+              [ "$v" = "null" ] && v=""
+            fi
+            printf '%s' "${v:-$2}"
+          }
+
+          SERVICE="$(cfg '.service' "${IN_SERVICE:-${GITHUB_REPOSITORY##*/}}")"
+          DOCKERFILE="$(cfg '.dockerfile' "$IN_DOCKERFILE")"
 
           if ! printf '%s' "$SERVICE" | grep -Eq '^[a-z]([-a-z0-9]*[a-z0-9])?$'; then
             echo "::error::服務名稱 '$SERVICE' 不符合 Cloud Run 規則（小寫字母開頭，只能有小寫字母/數字/連字號）。"
@@ -42,7 +88,8 @@ jobs:
             exit 1
           fi
 
-          for f in .cicd/env.dev .cicd/env.prod .cicd/secrets.dev .cicd/secrets.prod; do
+          for f in .cicd/env.common .cicd/env.dev .cicd/env.prod \
+                   .cicd/secrets.common .cicd/secrets.dev .cicd/secrets.prod; do
             [ -f "$f" ] || continue
             if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*='; then
               echo "::error::$f 有不合法的行。格式必須是 KEY=VALUE，一行一個。"
@@ -50,7 +97,7 @@ jobs:
             fi
           done
 
-          for f in .cicd/secrets.dev .cicd/secrets.prod; do
+          for f in .cicd/secrets.common .cicd/secrets.dev .cicd/secrets.prod; do
             [ -f "$f" ] || continue
             if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*=[a-z0-9][a-z0-9_-]*:(latest|[0-9]+)$'; then
               echo "::error::$f 格式錯誤。這個檔案只能放 Secret Manager 的『名字』，不能放值："
@@ -63,29 +110,28 @@ jobs:
           # INSTANCE_CONNECTION_NAME / DB_USER 由 CI 依部署環境推導後注入。手寫的話會跟
           # 注入值一起進 --update-env-vars，同名 key 誰贏未定義。deploy 的 verify 也有
           # 同一份檢查，但那要等併進 main 才會跑 —— 開發者要的是 PR 上就看到紅燈。
-          for E in dev prod; do
-            F=".cicd/env.${E}"
+          for F in .cicd/env.common .cicd/env.dev .cicd/env.prod; do
             [ -f "$F" ] || continue
             for KEY in INSTANCE_CONNECTION_NAME DB_USER; do
               if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
                 echo "::error::${F} 不可以自己設定 ${KEY} —— 這個值由 CI 依部署目標推導。"
-                echo "::error::請改成宣告 DB_INSTANCE=<instance 名稱>，CI 會組出 <專案>:<區域>:<instance>。"
+                echo "::error::請在 .cicd/config.yml 宣告 db.instance 與 db.name。"
+                exit 1
+              fi
+            done
+            for KEY in DB_INSTANCE DB_NAME; do
+              if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
+                echo "::error::${F} 的 ${KEY} 要搬到 .cicd/config.yml —— 那裡只宣告一次，不會 dev/prod 分歧："
+                echo "::error::  db:"
+                echo "::error::    instance: <instance 名稱>"
+                echo "::error::    name: <database 名稱>"
                 exit 1
               fi
             done
           done
 
-          # 只有一邊宣告 DB_INSTANCE 是合法的漸進上線，警告但不擋。
-          db_declared() {
-            [ -f ".cicd/env.$1" ] && grep -Eq '^[[:space:]]*DB_INSTANCE=' ".cicd/env.$1"
-          }
-          if db_declared dev && ! db_declared prod; then
-            echo "::warning::.cicd/env.dev 宣告了 DB_INSTANCE 但 .cicd/env.prod 沒有 —— prod 不會掛載 Cloud SQL。"
-          elif db_declared prod && ! db_declared dev; then
-            echo "::warning::.cicd/env.prod 宣告了 DB_INSTANCE 但 .cicd/env.dev 沒有 —— dev 不會掛載 Cloud SQL。"
-          fi
-
-          echo "✅ 契約檢查通過（service=${SERVICE}）"
+          echo "dockerfile=$DOCKERFILE" >> "$GITHUB_OUTPUT"
+          echo "✅ 契約檢查通過（service=${SERVICE}  dockerfile=${DOCKERFILE}）"
 
   build:
     name: 2 build
@@ -95,7 +141,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: docker build（不推）
         env:
-          DOCKERFILE: ${{ inputs.dockerfile }}
+          DOCKERFILE: ${{ needs.verify.outputs.dockerfile }}
         run: |
           set -euo pipefail
           docker build -f "$DOCKERFILE" -t "ci-check:${GITHUB_SHA:0:7}" .

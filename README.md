@@ -14,11 +14,16 @@ push tag vX.Y.Z → 取 main 建好的同一個 digest → 搬進 prod AR → �
 ## 開一個新專案
 
 ```bash
+# 第一次要先把本 repo 拉下來（腳本在這裡面）
+git clone https://github.com/adamsourceinfo-org/ci.git ~/repository/adamsourceinfo/ci
+
 cd ~/repository/adamsourceinfo/ci
 ./scripts/new-project.sh my-app --dir ~/repository/adamsourceinfo
 ```
 
 會建立 public repo、放進 stub 與 `.cicd/` 骨架、推上 main，並上 ruleset 保護 main（禁直推、禁 force push、強制 PR + 通過 ci 檢查）。
+
+需要 `gh` 已登入、且對 `adamsourceinfo-org` 有建 repo 的權限。
 
 > Free 方案的分支保護只對 public repo 有效，所以專案一律開 public。要讓 private repo 也能保護，得升級 GitHub Team。
 
@@ -56,24 +61,68 @@ CI **不跑測試**。測試是開發時自己該驗完才推上來的事，pipe
 my-app/
 ├─ Dockerfile              必要。容器要監聽 $PORT
 ├─ .github/workflows/
-│  ├─ deploy.yml           caller stub
-│  └─ ci.yml               caller stub
+│  ├─ deploy.yml           caller stub，照抄不用改
+│  └─ ci.yml               caller stub，照抄不用改
 └─ .cicd/
-   ├─ env.dev              非機密設定，KEY=VALUE，進版控
+   ├─ config.yml           結構性設定：service / region / db…（選填）
+   ├─ env.common           dev 與 prod 共用的非機密設定
+   ├─ env.dev              只有 dev 要的，同名 key 蓋過 common
    ├─ env.prod
-   ├─ secrets.dev          機密「掛載表」，只有名字沒有值
+   ├─ secrets.common       機密「掛載表」，只有名字沒有值
+   ├─ secrets.dev
    └─ secrets.prod
 ```
 
-### stub 可調參數
+### `.cicd/config.yml`
 
-| 參數 | 預設 | 說明 |
-|---|---|---|
-| `service` | repo 名稱 | Cloud Run 服務名稱 |
-| `region` | `asia-east1` | |
-| `health_path` | `/` | smoke test 打的路徑 |
-| `dockerfile` | `Dockerfile` | |
-| `allow_unauthenticated` | `true` | 是否開放未驗證存取 |
+放**一次性、不該 dev/prod 分歧**的東西。整份都是選填，沒有這個檔就用預設值。
+
+```yaml
+service: my-app            # 預設用 repo 名稱
+region: asia-east1
+health_path: /healthz      # smoke test 打的路徑，預設 /
+dockerfile: Dockerfile
+allow_unauthenticated: true
+
+db:                        # 要用 Cloud SQL 才需要，只宣告一次
+  instance: my-app-pg
+  name: my_app
+```
+
+打錯的 key 會被 `verify` 擋下並列出可用的名字 —— 設定檔最常見的失敗是「明明寫了卻沒生效」。
+
+### caller stub 長什麼樣
+
+`new-project.sh` 會自動放好。要手動把既有專案接上來的話，這兩支照抄即可：
+
+`.github/workflows/deploy.yml`
+```yaml
+name: deploy
+on:
+  push:
+    branches: [main]
+    tags: ["**"]           # 刻意收所有 tag 再由 ci 驗格式
+  workflow_dispatch:
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write      # 換 WIF 憑證必要
+    uses: adamsourceinfo-org/ci/.github/workflows/deploy.yml@main
+```
+
+`.github/workflows/ci.yml`
+```yaml
+name: ci
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  ci:
+    uses: adamsourceinfo-org/ci/.github/workflows/ci.yml@main
+```
+
+改這兩個檔不會讓你拿到任何 GCP 權限 —— 見下面的權限模型。
 
 ---
 
@@ -83,9 +132,13 @@ my-app/
 
 | 類型 | 放哪 | 誰寫 | 怎麼進 Cloud Run |
 |---|---|---|---|
-| 非機密設定 | `.cicd/env.<env>` | 開發者，進版控 | `--update-env-vars`（合併，不刪除） |
+| 兩邊共用的非機密設定 | `.cicd/env.common` | 開發者，進版控 | `--update-env-vars`（合併，不刪除） |
+| 只有某環境要的 | `.cicd/env.<env>` | 同上，**同名 key 蓋過 common** | 同上 |
 | 機密 | GCP Secret Manager | `scripts/set-secret.sh` 跑一次 | `--update-secrets`（只掛名字） |
 | `APP_ENV` / `APP_VERSION` | — | CI 自動注入 | prod 的 `APP_VERSION` 是 tag |
+| DB 連線字串 / 帳號 | — | CI 依部署目標推導 | 見「服務要用資料庫」 |
+
+**兩邊一樣的值寫在 `env.common` 就好。** 抄兩遍的東西遲早會分歧 —— 這是設定檔最常見的 bug，比打錯字常見得多。
 
 ```bash
 # 1. 寫值（值不經過 GitHub、不進版控、不出現在 log）
@@ -123,11 +176,12 @@ gcloud run services update <服務> --region=asia-east1 --project=<專案> --rem
 
 ## 服務要用資料庫
 
-在**兩個** `.cicd/env.<env>` 各加兩行，**內容完全一樣**：
+在 `.cicd/config.yml` 宣告**一次**（不是 dev/prod 各一份）：
 
-```
-DB_INSTANCE=my-app-pg
-DB_NAME=my_app
+```yaml
+db:
+  instance: my-app-pg
+  name: my_app
 ```
 
 就這樣。連線字串、DB 帳號、Cloud SQL 掛載，CI 依「正在部署哪個環境」自己推導：
@@ -139,15 +193,25 @@ DB_NAME=my_app
 
 外加部署時掛上 `--add-cloudsql-instances`。
 
-**為什麼不讓你自己寫連線字串**：因為那樣就有寫錯專案的機會。CI 本來就知道自己在部署哪個環境（它已經用這個知識注入 `APP_ENV`），讓它一併推導，dev 連到 prod 的 DB 就從「會被抓到的錯」變成**寫不出來的錯**。兩個 env 檔那兩行逐字相同，diff 沒有差異，連抄錯都不可能。
+**為什麼不讓你自己寫連線字串**：因為那樣就有寫錯專案的機會。CI 本來就知道自己在部署哪個環境（它已經用這個知識注入 `APP_ENV`），讓它一併推導，dev 連到 prod 的 DB 就從「會被抓到的錯」變成**寫不出來的錯**。
 
-> `INSTANCE_CONNECTION_NAME` 與 `DB_USER` 是 CI 保留字。在 `.cicd/env.*` 手寫會被 `verify` 擋下。
+> `INSTANCE_CONNECTION_NAME`、`DB_USER`、`DB_INSTANCE`、`DB_NAME` 在 `.cicd/env.*` 裡都是禁止的 —— 前兩個由 CI 推導，後兩個宣告在 `config.yml`。手寫會被 `verify` 擋下並告訴你該寫哪裡。
 
 ### 沒有密碼
 
 用 Cloud SQL **IAM 資料庫認證**：`run-runtime` SA 直接就是 Postgres 使用者，密碼是向 metadata server 要的 access token。Secret Manager 不用放任何 DB 機密，跟 WIF「一把金鑰都不存」是同一套邏輯。
 
-app 端這樣連（Python + pg8000，走 Cloud Run 注入的 unix socket）：
+app 端要裝一個 Postgres driver。純 Python 的 `pg8000` 在 alpine 上不用編譯：
+
+```dockerfile
+FROM python:3.12-alpine
+WORKDIR /app
+RUN pip install --no-cache-dir pg8000==1.31.2
+COPY app.py .
+CMD ["python", "-u", "app.py"]
+```
+
+然後這樣連（走 Cloud Run 注入的 unix socket，不是 IP）：
 
 ```python
 import os, json, urllib.request, pg8000.dbapi
@@ -168,6 +232,10 @@ conn = pg8000.dbapi.connect(
 ```
 
 ### 一次性開通（還沒自動化）
+
+> **這步需要 GCP 權限，而且要先做。** 順序是：有 GCP 權限的人先把 instance 開好 →
+> 開發者（或 agent）才寫 `config.yml` 那三行與 app 程式碼。反過來的話部署會成功、
+> 但 app 一連線就炸。
 
 ```bash
 PROJECT=adamsourceinfo-dev; INSTANCE=my-app-pg; DB=my_app
@@ -197,12 +265,19 @@ done
 所以建完 IAM 使用者**還是要 `GRANT`**，否則 app 連得上但一建表就 permission denied：
 
 ```bash
+# 內建的 postgres 帳號預設沒有密碼，先設一個一次性的（用完就沒用了，
+# IAM 認證的 app 完全不需要它；之後要再用就再設一次）。
+PGPASSWORD="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+gcloud sql users set-password postgres --instance="$INSTANCE" \
+  --project="$PROJECT" --password="$PGPASSWORD" --quiet
+
 # 一定要連進「目標 database」下 GRANT —— 每個 database 有自己的 public schema，
 # 連到預設的 postgres 庫下的話會成功但完全沒作用。
 cloud-sql-proxy "${PROJECT}:asia-east1:${INSTANCE}" --port 5433 \
   --token "$(gcloud auth print-access-token)" &
 
-PGPASSWORD=<postgres 密碼> psql -h 127.0.0.1 -p 5433 -U postgres -d "$DB" <<SQL
+export PGPASSWORD
+psql -h 127.0.0.1 -p 5433 -U postgres -d "$DB" <<SQL
 GRANT ALL ON SCHEMA public TO "run-runtime@${PROJECT}.iam";
 GRANT ALL PRIVILEGES ON DATABASE ${DB} TO "run-runtime@${PROJECT}.iam";
 SQL
@@ -218,14 +293,34 @@ gcloud sql instances patch my-app-pg --project=adamsourceinfo-dev --activation-p
 gcloud sql instances patch my-app-pg --project=adamsourceinfo-dev --activation-policy=ALWAYS  # 開
 ```
 
+### 怎麼確認接對了
+
+服務起來之後，讓它回報一個像這樣的健康資訊（`server_user` 與 `database` 要由 **DB 自己回答**，
+不能是環境變數回音，否則證明不了任何事）：
+
+```json
+{
+  "env": "dev",
+  "db": {
+    "instance": "adamsourceinfo-dev:asia-east1:my-app-pg",
+    "ok": true,
+    "server_user": "run-runtime@adamsourceinfo-dev.iam",
+    "database": "my_app"
+  }
+}
+```
+
+dev 與 prod 各打一次，`instance` 與 `server_user` 的專案名要各自對得上自己的環境。
+兩邊跑的是同一個 image（tag 走 digest promote），所以差異只可能來自 CI 推導 —— 這正是重點。
+
 ### 限制
 
 | 限制 | 說明 |
 |---|---|
 | DB 與 Cloud Run 必須同區域 | 推導假設 `<專案>:asia-east1:<instance>` |
 | 不支援跨專案 / 跨區域的 DB | 真的需要就手動 `gcloud run services update --add-cloudsql-instances`，疊加式旗標與 CI 並存不衝突 |
-| 只有一邊宣告 `DB_INSTANCE` | `verify` 警告但不擋 —— 「先在 dev 接上驗證再開 prod」是合法的漸進上線 |
-| 刪掉 `DB_INSTANCE` | ⚠️ 掛載不會自動消失，要手動 `--remove-cloudsql-instances`（與環境變數同一個取捨） |
+| 兩個環境的 instance 名字不能不同 | `config.yml` 只宣告一次。這是刻意的 —— 分歧的餘地就是出錯的餘地 |
+| 刪掉 `db:` 那段 | ⚠️ 掛載不會自動消失，要手動 `--remove-cloudsql-instances`（與環境變數同一個取捨） |
 
 ---
 

@@ -61,6 +61,12 @@ jobs:
     outputs:
       service: ${{ steps.contract.outputs.service }}
       short_sha: ${{ steps.contract.outputs.short_sha }}
+      region: ${{ steps.contract.outputs.region }}
+      health_path: ${{ steps.contract.outputs.health_path }}
+      dockerfile: ${{ steps.contract.outputs.dockerfile }}
+      allow_unauthenticated: ${{ steps.contract.outputs.allow_unauthenticated }}
+      db_instance: ${{ steps.contract.outputs.db_instance }}
+      db_name: ${{ steps.contract.outputs.db_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,11 +76,61 @@ jobs:
         id: contract
         env:
           IN_SERVICE: ${{ inputs.service }}
-          DOCKERFILE: ${{ inputs.dockerfile }}
+          IN_REGION: ${{ needs.verify.outputs.region }}
+          IN_HEALTH_PATH: ${{ needs.verify.outputs.health_path }}
+          IN_DOCKERFILE: ${{ needs.verify.outputs.dockerfile }}
+          IN_UNAUTH: ${{ needs.verify.outputs.allow_unauthenticated }}
         run: |
           set -euo pipefail
 
-          SERVICE="${IN_SERVICE:-${GITHUB_REPOSITORY##*/}}"
+          # ── .cicd/config.yml ─────────────────────────────────────────
+          # 專案的結構性設定收在這一份。沒有這個檔就全部退回 stub 的 with: 參數，
+          # 所以既有專案不改任何東西也照跑。yq 是 ubuntu runner 預裝的。
+          CFG=".cicd/config.yml"
+          if [ -f "$CFG" ]; then
+            command -v yq >/dev/null || { echo "::error::runner 沒有 yq，無法解析 ${CFG}"; exit 1; }
+            yq -e 'type == "!!map"' "$CFG" >/dev/null 2>&1 || {
+              echo "::error::${CFG} 必須是 YAML mapping（key: value）。"; exit 1; }
+
+            # 擋掉打錯的 key —— 設定檔最常見的失敗是「明明寫了卻沒生效」。
+            ALLOWED="service region health_path dockerfile allow_unauthenticated db"
+            for K in $(yq -r 'keys | .[]' "$CFG"); do
+              case " $ALLOWED " in
+                *" $K "*) ;;
+                *) echo "::error::${CFG} 有不認得的設定 '${K}'。可用的是：${ALLOWED}"; exit 1 ;;
+              esac
+            done
+            for K in $(yq -r '.db // {} | keys | .[]' "$CFG"); do
+              case "$K" in
+                instance|name) ;;
+                *) echo "::error::${CFG} 的 db 底下有不認得的設定 '${K}'。可用的是：instance name"; exit 1 ;;
+              esac
+            done
+          fi
+
+          cfg() {  # cfg <yq 路徑> <退回值>
+            local v=""
+            if [ -f "$CFG" ]; then
+              # 刻意不用 yq 的 // 運算子：它把 false 也當成「空值」，
+              # allow_unauthenticated: false 會被吃掉、退回預設的 true —— 服務靜靜變公開。
+              # 不吞錯誤：yq 失敗代表 config.yml 有問題，要大聲停下來，不是退回預設值。
+              v="$(yq -r "$1" "$CFG")"
+              [ "$v" = "null" ] && v=""
+            fi
+            printf '%s' "${v:-$2}"
+          }
+
+          SERVICE="$(cfg '.service' "${IN_SERVICE:-${GITHUB_REPOSITORY##*/}}")"
+          REGION="$(cfg '.region' "$IN_REGION")"
+          HEALTH_PATH="$(cfg '.health_path' "$IN_HEALTH_PATH")"
+          DOCKERFILE="$(cfg '.dockerfile' "$IN_DOCKERFILE")"
+          UNAUTH="$(cfg '.allow_unauthenticated' "$IN_UNAUTH")"
+          DB_INSTANCE="$(cfg '.db.instance' '')"
+          DB_NAME="$(cfg '.db.name' '')"
+
+          if [ -n "$DB_INSTANCE" ] && [ -z "$DB_NAME" ]; then
+            echo "::error::${CFG} 宣告了 db.instance 就必須一併給 db.name。"; exit 1
+          fi
           if ! printf '%s' "$SERVICE" | grep -Eq '^[a-z]([-a-z0-9]*[a-z0-9])?$'; then
             echo "::error::服務名稱 '$SERVICE' 不符合 Cloud Run 規則（小寫字母開頭，只能有小寫字母/數字/連字號）。請在 stub 用 service: 指定合法名稱。"
             exit 1
@@ -89,41 +145,45 @@ jobs:
             exit 1
           fi
 
-          echo "service=$SERVICE"        >> "$GITHUB_OUTPUT"
-          echo "short_sha=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-          echo "✅ service=$SERVICE  dockerfile=$DOCKERFILE  sha=${GITHUB_SHA:0:7}"
+          {
+            echo "service=$SERVICE"
+            echo "short_sha=${GITHUB_SHA:0:7}"
+            echo "region=$REGION"
+            echo "health_path=$HEALTH_PATH"
+            echo "dockerfile=$DOCKERFILE"
+            echo "allow_unauthenticated=$UNAUTH"
+            echo "db_instance=$DB_INSTANCE"
+            echo "db_name=$DB_NAME"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ service=$SERVICE  region=$REGION  dockerfile=$DOCKERFILE  sha=${GITHUB_SHA:0:7}"
+          [ -n "$DB_INSTANCE" ] && echo "   Cloud SQL：${DB_INSTANCE} / ${DB_NAME}（來自 ${CFG}，只宣告一次）"
 
       - name: 檢查 .cicd 設定契約
         run: |
           set -euo pipefail
 
-          # INSTANCE_CONNECTION_NAME / DB_USER 由 CI 依「正在部署哪個環境」推導後注入。
-          # 開發者手寫的話會跟注入值一起進 --update-env-vars，同名 key 誰贏未定義 ——
-          # 擋下來比安靜地不確定好。
-          for E in dev prod; do
-            F=".cicd/env.${E}"
+          # INSTANCE_CONNECTION_NAME / DB_USER 由 CI 依部署目標推導後注入；
+          # DB_INSTANCE / DB_NAME 現在宣告在 .cicd/config.yml（只寫一次）。
+          # 這些出現在 env 檔裡會跟注入值撞名，誰贏未定義 —— 擋下來比安靜地不確定好。
+          for F in .cicd/env.common .cicd/env.dev .cicd/env.prod; do
             [ -f "$F" ] || continue
             for KEY in INSTANCE_CONNECTION_NAME DB_USER; do
               if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
                 echo "::error::${F} 不可以自己設定 ${KEY} —— 這個值由 CI 依部署目標推導。"
-                echo "::error::請改成宣告 DB_INSTANCE=<instance 名稱>，CI 會組出 <專案>:<區域>:<instance>。"
+                echo "::error::請在 .cicd/config.yml 宣告 db.instance 與 db.name。"
+                exit 1
+              fi
+            done
+            for KEY in DB_INSTANCE DB_NAME; do
+              if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
+                echo "::error::${F} 的 ${KEY} 要搬到 .cicd/config.yml —— 那裡只宣告一次，不會 dev/prod 分歧："
+                echo "::error::  db:"
+                echo "::error::    instance: <instance 名稱>"
+                echo "::error::    name: <database 名稱>"
                 exit 1
               fi
             done
           done
-
-          # 只有一邊宣告 DB_INSTANCE 是合法的漸進上線（先在 dev 接上驗證再開 prod），
-          # 所以只警告不擋。靜靜放過的話「忘了開 prod」會拖到 runtime 才炸。
-          db_declared() {
-            [ -f ".cicd/env.$1" ] && grep -Eq '^[[:space:]]*DB_INSTANCE=' ".cicd/env.$1"
-          }
-          if db_declared dev && ! db_declared prod; then
-            echo "::warning::.cicd/env.dev 宣告了 DB_INSTANCE 但 .cicd/env.prod 沒有 —— prod 不會掛載 Cloud SQL。"
-            echo "⚠️ dev 宣告了 DB_INSTANCE，prod 沒有" >> "$GITHUB_STEP_SUMMARY"
-          elif db_declared prod && ! db_declared dev; then
-            echo "::warning::.cicd/env.prod 宣告了 DB_INSTANCE 但 .cicd/env.dev 沒有 —— dev 不會掛載 Cloud SQL。"
-            echo "⚠️ prod 宣告了 DB_INSTANCE，dev 沒有" >> "$GITHUB_STEP_SUMMARY"
-          fi
 
           echo "✅ .cicd 設定契約檢查通過"
 
@@ -181,7 +241,7 @@ jobs:
         env:
           SERVICE: ${{ needs.verify.outputs.service }}
           SHORT_SHA: ${{ needs.verify.outputs.short_sha }}
-          DOCKERFILE: ${{ inputs.dockerfile }}
+          DOCKERFILE: ${{ needs.verify.outputs.dockerfile }}
         run: |
           set -euo pipefail
           IMAGE="${AR_HOST}/${DEV_PROJECT}/${AR_REPO}/${SERVICE}"
@@ -230,10 +290,12 @@ jobs:
         env:
           SERVICE: ${{ needs.verify.outputs.service }}
           DIGEST: ${{ needs.build-push.outputs.digest }}
-          REGION: ${{ inputs.region }}
-          UNAUTH: ${{ inputs.allow_unauthenticated }}
+          REGION: ${{ needs.verify.outputs.region }}
+          UNAUTH: ${{ needs.verify.outputs.allow_unauthenticated }}
           ENV_NAME: dev
           PROJECT: adamsourceinfo-dev
+          DB_INSTANCE: ${{ needs.verify.outputs.db_instance }}
+          DB_NAME: ${{ needs.verify.outputs.db_name }}
         run: |
           set -euo pipefail
           IMAGE="${AR_HOST}/${PROJECT}/${AR_REPO}/${SERVICE}@${DIGEST}"
@@ -250,35 +312,42 @@ jobs:
           # 主控台設的變數不會被抹掉。
           # 代價：從 .cicd/env.<env> 刪掉一行，Cloud Run 上那個變數不會自動消失，
           # 要手動移除：gcloud run services update <svc> --remove-env-vars=KEY
+          # common 先讀、環境專屬後讀 —— 同名 key 由環境專屬覆蓋。兩邊一樣的設定只寫
+          # 一次就好，不用在 dev/prod 各抄一遍（抄兩遍的東西遲早會分歧）。
+          merge() {
+            for f in "$@"; do
+              [ -f "$f" ] && { grep -vE '^[[:space:]]*(#|$)' "$f" || true; }
+            done | awk -F= '
+              { k=$1; v=substr($0, index($0,"=")+1)
+                if (!(k in val)) order[++n]=k
+                val[k]=v }
+              END { for (i=1;i<=n;i++) print order[i]"="val[order[i]] }'
+          }
+
           PAIRS="APP_ENV=${ENV_NAME}"
           [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@@APP_VERSION=${APP_VERSION}"
-          if [ -f "$ENV_FILE" ]; then
-            while IFS= read -r line || [ -n "$line" ]; do
-              case "$line" in ''|'#'*) continue;; esac
-              case "$line" in DB_INSTANCE=*) DB_INSTANCE="${line#DB_INSTANCE=}";; esac
-              PAIRS="${PAIRS}@@${line}"
-            done < "$ENV_FILE"
-            echo "已套用 ${ENV_FILE}（合併模式，不會刪除既有變數）"
-          fi
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then PAIRS="${PAIRS}@@${line}"; fi
+          done <<< "$(merge '.cicd/env.common' "$ENV_FILE")"
+          echo "已套用 .cicd/env.common + ${ENV_FILE}（合併模式，不會刪除既有變數）"
 
           # ── Cloud SQL ────────────────────────────────────────────────
-          # 宣告 DB_INSTANCE 才啟用；沒宣告的服務行為與本功能不存在時逐字相同。
-          # 連線字串與 DB 帳號一律由 CI 從「正在部署哪個環境」推導 —— 開發者沒有地方
-          # 可以寫錯專案，兩個 .cicd/env.<env> 的 DB 設定逐字相同。
-          # 前提：Cloud SQL 與 Cloud Run 同區域。跨區/跨專案請手動掛載（--add 是疊加的）。
+          # DB 在 .cicd/config.yml 只宣告一次（不是 dev/prod 各一份）。連線字串與 DB 帳號
+          # 由 CI 依「正在部署哪個環境」推導 —— 連錯環境不是「會被抓到」，是根本沒有
+          # 欄位可以寫錯。前提：Cloud SQL 與 Cloud Run 同區域。
           if [ -n "${DB_INSTANCE:-}" ]; then
             ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+            PAIRS="${PAIRS}@@DB_INSTANCE=${DB_INSTANCE}@@DB_NAME=${DB_NAME}"
             PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
             echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
           fi
 
           SEC_PAIRS=""
-          if [ -f "$SEC_FILE" ]; then
-            while IFS= read -r line || [ -n "$line" ]; do
-              case "$line" in ''|'#'*) continue;; esac
-              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@@}${line}"
-            done < "$SEC_FILE"
-            echo "已掛載 ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@@}${line}"; fi
+          done <<< "$(merge '.cicd/secrets.common' "$SEC_FILE")"
+          if [ -n "$SEC_PAIRS" ]; then
+            echo "已掛載 .cicd/secrets.common + ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
           fi
 
           ARGS=(
@@ -319,7 +388,7 @@ jobs:
       - name: 健康檢查
         env:
           URL: ${{ needs.deploy-dev.outputs.url }}
-          HEALTH_PATH: ${{ inputs.health_path }}
+          HEALTH_PATH: ${{ needs.verify.outputs.health_path }}
         run: |
           set -euo pipefail
           TARGET="${URL%/}${HEALTH_PATH}"
@@ -495,11 +564,13 @@ jobs:
         env:
           SERVICE: ${{ needs.verify.outputs.service }}
           DIGEST: ${{ needs.promote.outputs.digest }}
-          REGION: ${{ inputs.region }}
-          UNAUTH: ${{ inputs.allow_unauthenticated }}
+          REGION: ${{ needs.verify.outputs.region }}
+          UNAUTH: ${{ needs.verify.outputs.allow_unauthenticated }}
           APP_VERSION: ${{ github.ref_name }}
           ENV_NAME: prod
           PROJECT: adamsourceinfo-prod
+          DB_INSTANCE: ${{ needs.verify.outputs.db_instance }}
+          DB_NAME: ${{ needs.verify.outputs.db_name }}
         run: |
           set -euo pipefail
           IMAGE="${AR_HOST}/${PROJECT}/${AR_REPO}/${SERVICE}@${DIGEST}"
@@ -516,35 +587,42 @@ jobs:
           # 主控台設的變數不會被抹掉。
           # 代價：從 .cicd/env.<env> 刪掉一行，Cloud Run 上那個變數不會自動消失，
           # 要手動移除：gcloud run services update <svc> --remove-env-vars=KEY
+          # common 先讀、環境專屬後讀 —— 同名 key 由環境專屬覆蓋。兩邊一樣的設定只寫
+          # 一次就好，不用在 dev/prod 各抄一遍（抄兩遍的東西遲早會分歧）。
+          merge() {
+            for f in "$@"; do
+              [ -f "$f" ] && { grep -vE '^[[:space:]]*(#|$)' "$f" || true; }
+            done | awk -F= '
+              { k=$1; v=substr($0, index($0,"=")+1)
+                if (!(k in val)) order[++n]=k
+                val[k]=v }
+              END { for (i=1;i<=n;i++) print order[i]"="val[order[i]] }'
+          }
+
           PAIRS="APP_ENV=${ENV_NAME}"
           [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@@APP_VERSION=${APP_VERSION}"
-          if [ -f "$ENV_FILE" ]; then
-            while IFS= read -r line || [ -n "$line" ]; do
-              case "$line" in ''|'#'*) continue;; esac
-              case "$line" in DB_INSTANCE=*) DB_INSTANCE="${line#DB_INSTANCE=}";; esac
-              PAIRS="${PAIRS}@@${line}"
-            done < "$ENV_FILE"
-            echo "已套用 ${ENV_FILE}（合併模式，不會刪除既有變數）"
-          fi
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then PAIRS="${PAIRS}@@${line}"; fi
+          done <<< "$(merge '.cicd/env.common' "$ENV_FILE")"
+          echo "已套用 .cicd/env.common + ${ENV_FILE}（合併模式，不會刪除既有變數）"
 
           # ── Cloud SQL ────────────────────────────────────────────────
-          # 宣告 DB_INSTANCE 才啟用；沒宣告的服務行為與本功能不存在時逐字相同。
-          # 連線字串與 DB 帳號一律由 CI 從「正在部署哪個環境」推導 —— 開發者沒有地方
-          # 可以寫錯專案，兩個 .cicd/env.<env> 的 DB 設定逐字相同。
-          # 前提：Cloud SQL 與 Cloud Run 同區域。跨區/跨專案請手動掛載（--add 是疊加的）。
+          # DB 在 .cicd/config.yml 只宣告一次（不是 dev/prod 各一份）。連線字串與 DB 帳號
+          # 由 CI 依「正在部署哪個環境」推導 —— 連錯環境不是「會被抓到」，是根本沒有
+          # 欄位可以寫錯。前提：Cloud SQL 與 Cloud Run 同區域。
           if [ -n "${DB_INSTANCE:-}" ]; then
             ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+            PAIRS="${PAIRS}@@DB_INSTANCE=${DB_INSTANCE}@@DB_NAME=${DB_NAME}"
             PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
             echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
           fi
 
           SEC_PAIRS=""
-          if [ -f "$SEC_FILE" ]; then
-            while IFS= read -r line || [ -n "$line" ]; do
-              case "$line" in ''|'#'*) continue;; esac
-              SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@@}${line}"
-            done < "$SEC_FILE"
-            echo "已掛載 ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
+          while IFS= read -r line; do
+            if [ -n "$line" ]; then SEC_PAIRS="${SEC_PAIRS:+${SEC_PAIRS}@@}${line}"; fi
+          done <<< "$(merge '.cicd/secrets.common' "$SEC_FILE")"
+          if [ -n "$SEC_PAIRS" ]; then
+            echo "已掛載 .cicd/secrets.common + ${SEC_FILE}（只掛名字，值留在 Secret Manager）"
           fi
 
           ARGS=(
@@ -585,7 +663,7 @@ jobs:
       - name: 健康檢查
         env:
           URL: ${{ needs.deploy-prod.outputs.url }}
-          HEALTH_PATH: ${{ inputs.health_path }}
+          HEALTH_PATH: ${{ needs.verify.outputs.health_path }}
         run: |
           set -euo pipefail
           TARGET="${URL%/}${HEALTH_PATH}"

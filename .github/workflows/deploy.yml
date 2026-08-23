@@ -162,6 +162,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          for f in .cicd/env.common .cicd/env.dev .cicd/env.prod \
+                   .cicd/secrets.common .cicd/secrets.dev .cicd/secrets.prod; do
+            [ -f "$f" ] || continue
+            if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*='; then
+              echo "::error::$f 有不合法的行。格式必須是 KEY=VALUE，一行一個。"
+              exit 1
+            fi
+          done
+
+          for f in .cicd/secrets.common .cicd/secrets.dev .cicd/secrets.prod; do
+            [ -f "$f" ] || continue
+            if grep -vE '^\s*(#|$)' "$f" | grep -qvE '^[A-Za-z_][A-Za-z0-9_]*=[a-z0-9][a-z0-9_-]*:(latest|[0-9]+)$'; then
+              echo "::error::$f 格式錯誤。這個檔案只能放 Secret Manager 的『名字』，不能放值："
+              echo "::error::  正確 → DB_PASSWORD=myapp-db-password-dev:latest"
+              echo "::error::  錯誤 → DB_PASSWORD=hunter2"
+              exit 1
+            fi
+          done
+
           # INSTANCE_CONNECTION_NAME / DB_USER 由 CI 依部署目標推導後注入；
           # DB_INSTANCE / DB_NAME 現在宣告在 .cicd/config.yml（只寫一次）。
           # 這些出現在 env 檔裡會跟注入值撞名，誰贏未定義 —— 擋下來比安靜地不確定好。
@@ -188,7 +207,7 @@ jobs:
           echo "✅ .cicd 設定契約檢查通過"
 
       - name: 驗證 tag（僅 tag 觸發）
-        if: github.ref_type == 'tag'
+        if: github.event_name != 'pull_request' && github.ref_type == 'tag'
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
@@ -207,9 +226,28 @@ jobs:
           echo "✅ tag $TAG 格式正確且指向 main"
 
   # ── 2. build-push（只有 main）───────────────────────────────────────────────
+  # ── PR 專用：只證明建得起來，完全不碰 GCP ─────────────────────────────────
+  # 這個 job 刻意「沒有」permissions: id-token: write —— PR 的程式碼拿不到、也換不到
+  # 任何雲端憑證。合併 ci.yml 進來之後，這條界線只剩下面這個 if: 和缺席的 permissions
+  # 在守，所以它們是安全邊界的一部分，不是風格。
+  build:
+    name: 2 build（PR）
+    if: github.event_name == 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build（不推）
+        env:
+          DOCKERFILE: ${{ needs.verify.outputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          docker build -f "$DOCKERFILE" -t "ci-check:${GITHUB_SHA:0:7}" .
+          echo "✅ image 建置成功"
+
   build-push:
     name: 2 build-push → dev AR
-    if: github.ref_type == 'branch'
+    if: github.event_name != 'pull_request' && github.ref_type == 'branch'
     needs: verify
     runs-on: ubuntu-latest
     permissions:
@@ -258,7 +296,7 @@ jobs:
   # ── 3. deploy-dev（只有 main）──────────────────────────────────────────────
   deploy-dev:
     name: 3 deploy → dev
-    if: github.ref_type == 'branch'
+    if: github.event_name != 'pull_request' && github.ref_type == 'branch'
     needs: [verify, build-push]
     runs-on: ubuntu-latest
     permissions:
@@ -337,6 +375,19 @@ jobs:
           # 欄位可以寫錯。前提：Cloud SQL 與 Cloud Run 同區域。
           if [ -n "${DB_INSTANCE:-}" ]; then
             ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+
+            # instance 不存在就停在這裡，講清楚缺什麼、誰該補。
+            # 刻意不自動建立：要 10 分鐘、會計費，而且 config.yml 打錯一個字就多開一台。
+            # Cloud Run service 本身則相反 —— gcloud run deploy 沒有就建，有就更新。
+            if ! gcloud sql instances describe "$DB_INSTANCE" --project="$PROJECT" >/dev/null 2>&1; then
+              echo "::error::${PROJECT} 找不到 Cloud SQL instance「${DB_INSTANCE}」（.cicd/config.yml 的 db.instance）。"
+              echo "::error::這是一次性資源，要有 GCP 權限的人跑一次，不是 CI 的職責："
+              echo "::error::  gcloud sql instances create ${DB_INSTANCE} --project=${PROJECT} --region=${REGION} \\"
+              echo "::error::    --edition=ENTERPRISE --database-version=POSTGRES_17 --tier=db-f1-micro \\"
+              echo "::error::    --database-flags=cloudsql.iam_authentication=on"
+              echo "::error::建完還要 create database / IAM user / GRANT —— 完整步驟見 ci/README.md「服務要用資料庫」。"
+              exit 1
+            fi
             PAIRS="${PAIRS}@@DB_INSTANCE=${DB_INSTANCE}@@DB_NAME=${DB_NAME}"
             PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
             echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
@@ -381,7 +432,7 @@ jobs:
   # ── 4. smoke-dev（只有 main）───────────────────────────────────────────────
   smoke-dev:
     name: 4 smoke dev
-    if: github.ref_type == 'branch'
+    if: github.event_name != 'pull_request' && github.ref_type == 'branch'
     needs: [verify, build-push, deploy-dev]
     runs-on: ubuntu-latest
     steps:
@@ -420,7 +471,7 @@ jobs:
   # main pipeline —— 擋下來，不要用重建的方式蒙混過去。
   resolve:
     name: 5 resolve digest
-    if: github.ref_type == 'tag'
+    if: github.event_name != 'pull_request' && github.ref_type == 'tag'
     needs: verify
     runs-on: ubuntu-latest
     permissions:
@@ -467,7 +518,7 @@ jobs:
   # imagetools 走 cross-repo blob mount，不會真的重傳 layer。
   promote:
     name: 6 promote → prod AR
-    if: github.ref_type == 'tag'
+    if: github.event_name != 'pull_request' && github.ref_type == 'tag'
     needs: [verify, resolve]
     runs-on: ubuntu-latest
     permissions:
@@ -532,7 +583,7 @@ jobs:
   # ── 7. deploy-prod（只有 tag）─────────────────────────────────────────────
   deploy-prod:
     name: 7 deploy → prod
-    if: github.ref_type == 'tag'
+    if: github.event_name != 'pull_request' && github.ref_type == 'tag'
     needs: [verify, promote]
     runs-on: ubuntu-latest
     permissions:
@@ -612,6 +663,19 @@ jobs:
           # 欄位可以寫錯。前提：Cloud SQL 與 Cloud Run 同區域。
           if [ -n "${DB_INSTANCE:-}" ]; then
             ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+
+            # instance 不存在就停在這裡，講清楚缺什麼、誰該補。
+            # 刻意不自動建立：要 10 分鐘、會計費，而且 config.yml 打錯一個字就多開一台。
+            # Cloud Run service 本身則相反 —— gcloud run deploy 沒有就建，有就更新。
+            if ! gcloud sql instances describe "$DB_INSTANCE" --project="$PROJECT" >/dev/null 2>&1; then
+              echo "::error::${PROJECT} 找不到 Cloud SQL instance「${DB_INSTANCE}」（.cicd/config.yml 的 db.instance）。"
+              echo "::error::這是一次性資源，要有 GCP 權限的人跑一次，不是 CI 的職責："
+              echo "::error::  gcloud sql instances create ${DB_INSTANCE} --project=${PROJECT} --region=${REGION} \\"
+              echo "::error::    --edition=ENTERPRISE --database-version=POSTGRES_17 --tier=db-f1-micro \\"
+              echo "::error::    --database-flags=cloudsql.iam_authentication=on"
+              echo "::error::建完還要 create database / IAM user / GRANT —— 完整步驟見 ci/README.md「服務要用資料庫」。"
+              exit 1
+            fi
             PAIRS="${PAIRS}@@DB_INSTANCE=${DB_INSTANCE}@@DB_NAME=${DB_NAME}"
             PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
             echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
@@ -656,7 +720,7 @@ jobs:
   # ── 8. smoke-prod（只有 tag）──────────────────────────────────────────────
   smoke-prod:
     name: 8 smoke prod
-    if: github.ref_type == 'tag'
+    if: github.event_name != 'pull_request' && github.ref_type == 'tag'
     needs: [verify, resolve, promote, deploy-prod]
     runs-on: ubuntu-latest
     steps:

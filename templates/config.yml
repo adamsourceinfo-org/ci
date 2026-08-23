@@ -1,6 +1,4 @@
 # 專案的結構性設定。全部選填 —— 刪掉整個檔案也能跑，只是全用預設值。
-#
-# 這裡放「一次性、不該 dev/prod 分歧」的東西。
 # 常改的環境變數請放 .cicd/env.common 與 .cicd/env.<env>。
 
 # service: my-app          # Cloud Run 服務名稱，預設用 repo 名稱
@@ -10,9 +8,7 @@
 # allow_unauthenticated: true
 
 # 要用 Cloud SQL 就打開這段。注意「只宣告一次」—— 不是 dev/prod 各一份。
-# 連線字串（<專案>:<區域>:<instance>）與 DB 帳號（run-runtime@<專案>.iam）
-# 由 CI 依部署目標推導，所以沒有寫錯環境的餘地。
-# 開通步驟見 ci/README.md「服務要用資料庫」。
+# instance 必須先由有 GCP 權限的人建好，CI 不會自動建（見 README）。
 # db:
 #   instance: my-app-pg
 #   name: my_app

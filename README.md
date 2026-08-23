@@ -113,7 +113,7 @@ curl -sL https://raw.githubusercontent.com/adamsourceinfo-org/ci/main/templates/
 再自備 `Dockerfile`（容器要監聽 `$PORT`），推上 main 就會部署 dev。
 
 **分支保護是 repo 自己的治理設定，不是這裡的事。** 在 GitHub 介面或 org ruleset 設定即可；
-required check 用 `deploy / 2 build（PR）`。
+required check 用 `deploy / 2 build`。
 
 > Free 方案的分支保護只對 public repo 有效。要 private + 保護得升級 GitHub Team。
 
@@ -364,7 +364,7 @@ attribute.job_workflow_ref ==
 
 `deploy.yml` 同時服務 PR 與部署，界線由兩件事守住：
 
-1. `build（PR）` 這個 job **沒有** `permissions: id-token: write`
+1. `build` 這個 job（PR 專用） **沒有** `permissions: id-token: write`
 2. 每一個碰 GCP 的 job 都有 `if: github.event_name != 'pull_request'`
 
 這兩者是安全邊界的一部分，不是風格。改動 `deploy.yml` 時務必保持。

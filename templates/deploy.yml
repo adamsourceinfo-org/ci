@@ -1,13 +1,16 @@
 # 由 adamsourceinfo-org/ci 提供。部署邏輯全部在 ci repo，這裡只負責呼叫它。
 #
 # 改這個檔不會讓你拿到任何 GCP 權限 —— 換取雲端憑證的條件綁死在
-# "adamsourceinfo-org/ci/.github/workflows/deploy.yml@refs/heads/main"。從別的 workflow 呼叫換不到。
+# "adamsourceinfo-org/ci/.github/workflows/deploy.yml@refs/heads/main"。
 #
-# 兩條路：
-#   push main → 部署 adamsourceinfo-dev
-#   push tag  → 把 main 建好的同一個 image 搬去 adamsourceinfo-prod（不重新 build）
+# 三條路：
+#   PR          → 只 build，證明建得起來（完全不碰 GCP）
+#   push main   → build → 部署 adamsourceinfo-dev
+#   push tag    → 把 main 建好的同一個 image 搬去 adamsourceinfo-prod（不重新 build）
 name: deploy
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
     # 刻意收「所有」tag 再由 ci 驗格式。用 glob 過濾的話，推一個格式不對的 tag
@@ -22,4 +25,3 @@ jobs:
       id-token: write
     uses: adamsourceinfo-org/ci/.github/workflows/deploy.yml@main
     # 專案設定放 .cicd/config.yml，這支 stub 不用改。
-    # （with: 的參數仍然可用，但 config.yml 的值會蓋過它。）

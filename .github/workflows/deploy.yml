@@ -132,7 +132,12 @@ jobs:
           workload_identity_provider: projects/${{ env.DEV_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.DEV_PROJECT }}.iam.gserviceaccount.com
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: 確認 gcloud 可用
+        run: |
+          # ubuntu runner 預裝 gcloud，所以不用 setup-gcloud（那一步每個 job 要花 15~25 秒）。
+          # 若哪天 runner image 拿掉了，這裡會立刻紅燈，而不是在後面噴看不懂的錯。
+          command -v gcloud >/dev/null || { echo "::error::runner 沒有預裝 gcloud，請把 setup-gcloud 加回來"; exit 1; }
+          gcloud --version | head -1
 
       - name: docker 登入 Artifact Registry
         run: gcloud auth configure-docker "${AR_HOST}" --quiet
@@ -179,7 +184,12 @@ jobs:
           workload_identity_provider: projects/${{ env.DEV_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.DEV_PROJECT }}.iam.gserviceaccount.com
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: 確認 gcloud 可用
+        run: |
+          # ubuntu runner 預裝 gcloud，所以不用 setup-gcloud（那一步每個 job 要花 15~25 秒）。
+          # 若哪天 runner image 拿掉了，這裡會立刻紅燈，而不是在後面噴看不懂的錯。
+          command -v gcloud >/dev/null || { echo "::error::runner 沒有預裝 gcloud，請把 setup-gcloud 加回來"; exit 1; }
+          gcloud --version | head -1
 
       - name: gcloud run deploy
         id: deploy
@@ -201,21 +211,19 @@ jobs:
           ENV_FILE=".cicd/env.${ENV_NAME}"
           SEC_FILE=".cicd/secrets.${ENV_NAME}"
 
-          # 有 .cicd/env.<env> → --set-env-vars，此檔為唯一真相（刪掉一行，Cloud Run 上也會消失）
-          # 沒有             → --update-env-vars，只補 APP_ENV/APP_VERSION，
-          #                     完全不動你自己在 Cloud Run 主控台設的變數
+          # 一律用 --update-env-vars（合併），永遠不用 --set-env-vars（取代全部）。
+          # CI 只新增/更新它認得的變數，絕不刪除任何它不知道的東西 —— 你在 Cloud Run
+          # 主控台設的變數不會被抹掉。
+          # 代價：從 .cicd/env.<env> 刪掉一行，Cloud Run 上那個變數不會自動消失，
+          # 要手動移除：gcloud run services update <svc> --remove-env-vars=KEY
           PAIRS="APP_ENV=${ENV_NAME}"
           [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
-          ENV_MODE="--update-env-vars"
           if [ -f "$ENV_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
               PAIRS="${PAIRS}@${line}"
             done < "$ENV_FILE"
-            ENV_MODE="--set-env-vars"
-            echo "已套用 ${ENV_FILE}（宣告式：此檔為唯一真相）"
-          else
-            echo "沒有 ${ENV_FILE}，只補 APP_ENV/APP_VERSION，不動既有環境變數"
+            echo "已套用 ${ENV_FILE}（合併模式，不會刪除既有變數）"
           fi
 
           SEC_PAIRS=""
@@ -235,10 +243,10 @@ jobs:
             --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
-            "${ENV_MODE}=^@^${PAIRS}"
+            "--update-env-vars=^@^${PAIRS}"
           )
           if [ -n "$SEC_PAIRS" ]; then
-            ARGS+=("--set-secrets=^@^${SEC_PAIRS}")
+            ARGS+=("--update-secrets=^@^${SEC_PAIRS}")
           fi
           if [ "$UNAUTH" = "true" ]; then
             ARGS+=(--allow-unauthenticated)
@@ -309,7 +317,12 @@ jobs:
           workload_identity_provider: projects/${{ env.DEV_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.DEV_PROJECT }}.iam.gserviceaccount.com
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: 確認 gcloud 可用
+        run: |
+          # ubuntu runner 預裝 gcloud，所以不用 setup-gcloud（那一步每個 job 要花 15~25 秒）。
+          # 若哪天 runner image 拿掉了，這裡會立刻紅燈，而不是在後面噴看不懂的錯。
+          command -v gcloud >/dev/null || { echo "::error::runner 沒有預裝 gcloud，請把 setup-gcloud 加回來"; exit 1; }
+          gcloud --version | head -1
 
       - name: 反查 digest
         id: find
@@ -351,7 +364,12 @@ jobs:
           workload_identity_provider: projects/${{ env.PROD_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.PROD_PROJECT }}.iam.gserviceaccount.com
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: 確認 gcloud 可用
+        run: |
+          # ubuntu runner 預裝 gcloud，所以不用 setup-gcloud（那一步每個 job 要花 15~25 秒）。
+          # 若哪天 runner image 拿掉了，這裡會立刻紅燈，而不是在後面噴看不懂的錯。
+          command -v gcloud >/dev/null || { echo "::error::runner 沒有預裝 gcloud，請把 setup-gcloud 加回來"; exit 1; }
+          gcloud --version | head -1
 
       - name: 安裝 crane
         env:
@@ -416,7 +434,12 @@ jobs:
           workload_identity_provider: projects/${{ env.PROD_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
           service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.PROD_PROJECT }}.iam.gserviceaccount.com
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - name: 確認 gcloud 可用
+        run: |
+          # ubuntu runner 預裝 gcloud，所以不用 setup-gcloud（那一步每個 job 要花 15~25 秒）。
+          # 若哪天 runner image 拿掉了，這裡會立刻紅燈，而不是在後面噴看不懂的錯。
+          command -v gcloud >/dev/null || { echo "::error::runner 沒有預裝 gcloud，請把 setup-gcloud 加回來"; exit 1; }
+          gcloud --version | head -1
 
       - name: gcloud run deploy
         id: deploy
@@ -439,21 +462,19 @@ jobs:
           ENV_FILE=".cicd/env.${ENV_NAME}"
           SEC_FILE=".cicd/secrets.${ENV_NAME}"
 
-          # 有 .cicd/env.<env> → --set-env-vars，此檔為唯一真相（刪掉一行，Cloud Run 上也會消失）
-          # 沒有             → --update-env-vars，只補 APP_ENV/APP_VERSION，
-          #                     完全不動你自己在 Cloud Run 主控台設的變數
+          # 一律用 --update-env-vars（合併），永遠不用 --set-env-vars（取代全部）。
+          # CI 只新增/更新它認得的變數，絕不刪除任何它不知道的東西 —— 你在 Cloud Run
+          # 主控台設的變數不會被抹掉。
+          # 代價：從 .cicd/env.<env> 刪掉一行，Cloud Run 上那個變數不會自動消失，
+          # 要手動移除：gcloud run services update <svc> --remove-env-vars=KEY
           PAIRS="APP_ENV=${ENV_NAME}"
           [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@APP_VERSION=${APP_VERSION}"
-          ENV_MODE="--update-env-vars"
           if [ -f "$ENV_FILE" ]; then
             while IFS= read -r line || [ -n "$line" ]; do
               case "$line" in ''|'#'*) continue;; esac
               PAIRS="${PAIRS}@${line}"
             done < "$ENV_FILE"
-            ENV_MODE="--set-env-vars"
-            echo "已套用 ${ENV_FILE}（宣告式：此檔為唯一真相）"
-          else
-            echo "沒有 ${ENV_FILE}，只補 APP_ENV/APP_VERSION，不動既有環境變數"
+            echo "已套用 ${ENV_FILE}（合併模式，不會刪除既有變數）"
           fi
 
           SEC_PAIRS=""
@@ -473,10 +494,10 @@ jobs:
             --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
-            "${ENV_MODE}=^@^${PAIRS}"
+            "--update-env-vars=^@^${PAIRS}"
           )
           if [ -n "$SEC_PAIRS" ]; then
-            ARGS+=("--set-secrets=^@^${SEC_PAIRS}")
+            ARGS+=("--update-secrets=^@^${SEC_PAIRS}")
           fi
           if [ "$UNAUTH" = "true" ]; then
             ARGS+=(--allow-unauthenticated)

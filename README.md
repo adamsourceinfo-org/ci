@@ -83,8 +83,8 @@ my-app/
 
 | 類型 | 放哪 | 誰寫 | 怎麼進 Cloud Run |
 |---|---|---|---|
-| 非機密設定 | `.cicd/env.<env>` | 開發者，進版控 | `--set-env-vars`（宣告式） |
-| 機密 | GCP Secret Manager | `scripts/set-secret.sh` 跑一次 | `--set-secrets`（只掛名字） |
+| 非機密設定 | `.cicd/env.<env>` | 開發者，進版控 | `--update-env-vars`（合併，不刪除） |
+| 機密 | GCP Secret Manager | `scripts/set-secret.sh` 跑一次 | `--update-secrets`（只掛名字） |
 | `APP_ENV` / `APP_VERSION` | — | CI 自動注入 | prod 的 `APP_VERSION` 是 tag |
 
 ```bash
@@ -99,16 +99,24 @@ echo 'DB_PASSWORD=my-app-db-password:latest' >> .cicd/secrets.prod
 
 > `.cicd/env.*` 與 `.cicd/secrets.*` 的值可以含逗號 — 部署時用 `^@^` 自訂分隔符。
 
-### 不想讓 CI 管設定也可以
+### CI 永遠不覆蓋你的設定
 
-| 專案有沒有 `.cicd/env.<env>` | CI 行為 |
+一律用 `--update-env-vars` / `--update-secrets`（合併），**從不**用 `--set-*`（取代全部）。CI 只新增或更新它認得的鍵，絕不刪除它不知道的東西。
+
+| 你做的事 | 會發生什麼 |
 |---|---|
-| **有** | `--set-env-vars`：檔案是唯一真相。從檔案刪掉一行，Cloud Run 上也會消失 |
-| **沒有** | `--update-env-vars`：只補 `APP_ENV` / `APP_VERSION`，**完全不動**你自己在 Cloud Run 設的任何變數 |
+| 在 Cloud Run 主控台加一個環境變數 | 保留，之後每次部署都還在 |
+| 手動調 min/max instances、CPU、記憶體、concurrency | 保留（CI 從不傳這些參數） |
+| 在 `.cicd/env.<env>` 加一行 | 下次部署套用 |
+| 在 `.cicd/env.<env>` **刪掉**一行 | ⚠️ Cloud Run 上**不會**消失 |
 
-沒有 `.cicd/secrets.<env>` 就完全不下 `--set-secrets`。所以「專案自己在 Cloud Run 裡設定」這條路是通的，CI 不會干擾。
+最後一列是這個選擇的代價。要真的移除一個變數：
 
-注意：一旦建立了 `.cicd/env.<env>`，就等於宣告「這個檔案管全部」—— 手動在主控台加的變數會在下次部署被抹掉。這是宣告式的代價，也是它的價值。
+```bash
+gcloud run services update <服務> --region=asia-east1 --project=<專案> --remove-env-vars=KEY
+```
+
+（實測驗證過：手動設 `min=1`、`concurrency=40`、`memory=1Gi`，連續兩次 CI 部署後三個值都還在。）
 
 ---
 

@@ -21,7 +21,7 @@ digest 就變了），複製完還會比對 digest，不一致就中止。
 | 誰 | 做什麼 | 多久一次 | 用什麼憑證 |
 |---|---|---|---|
 | **你（owner）** | GCP 專案、API、WIF、SA、IAM、Cloud SQL instance | 一次 | 你自己的 `gcloud` |
-| **你（owner）** | 服務的執行身分 SA、database、`GRANT` | 每個要用 DB 的服務一次 | 你自己的 `gcloud` |
+| **你（owner）** | 服務的執行身分、database、`GRANT` | 每服務一次 | `ci/scripts/provision-service.sh` |
 | **你（owner）** | 建 repo、分支保護 | 每個新專案一次 | 你自己的 `gh` |
 | **開發者** | 程式碼、`.cicd/` 設定、secret 的**值** | 日常 | 自己的 |
 | **CI（本 repo）** | build → deploy → 掛設定 → smoke | 每次 push | WIF 換來的**短期**憑證 |
@@ -54,6 +54,22 @@ gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
 # 2. Artifact Registry
 gcloud artifacts repositories create "$AR_REPO" --repository-format=docker \
   --location="$REGION" --project="$PROJECT" --quiet
+
+#    清理政策。每次 push 都新增一個 image，沒有回收的話只會單向成長。
+#    Keep 規則優先於 Delete，而 keepCount 是「每個 image 各保留 N 個」——
+#    所以久未部署的服務，它正在跑的那個 image 仍在最新 10 個之內，不會被刪。
+cat > /tmp/ar-policy.json <<'JSON'
+[
+  {"name":"keep-recent","action":{"type":"Keep"},
+   "mostRecentVersions":{"keepCount":10}},
+  {"name":"delete-untagged-30d","action":{"type":"Delete"},
+   "condition":{"tagState":"untagged","olderThan":"30d"}},
+  {"name":"delete-old-90d","action":{"type":"Delete"},
+   "condition":{"tagState":"any","olderThan":"90d"}}
+]
+JSON
+gcloud artifacts repositories set-cleanup-policies "$AR_REPO" \
+  --location="$REGION" --project="$PROJECT" --policy=/tmp/ar-policy.json --no-dry-run
 
 # 3. 兩個身分。執行身分刻意「不是」預設 compute SA —— 那個帶 Editor，
 #    等於每個服務都是專案管理員。
@@ -140,6 +156,10 @@ $0.08/GiB-月，這種規模等於幾分錢，沒有不開的理由。
 ---
 
 ## 開一個新專案
+
+> **服務要用資料庫的話，先跑 `ci/scripts/provision-service.sh` 再推第一版**
+> （見下面「服務要用資料庫」）。沒先跑的話第一次部署會停在 `preflight`
+> 並告訴你缺什麼——硬失敗是設計，不是壞掉，但知道比較不心慌。
 
 ```bash
 gh repo create adamsourceinfo-org/my-app --public --clone && cd my-app
@@ -354,88 +374,43 @@ conn = pg8000.dbapi.connect(
 )
 ```
 
-### 一次性清單（你，每個服務、每個環境各跑一次）
+### 一次性清單（你，每個服務跑一次）
 
 **CI 刻意不自動做這些。** instance 要 10 分鐘且會計費；SA 更關鍵——一個能建 SA
 又能發角色的部署身分，等於能把任何權限發給自己，WIF 那道「只有一支 workflow
 換得到憑證」的鎖就白做了。所以 `github-deployer` 沒有任何 `iam.*` 權限。
-缺什麼，部署會停在該步並印出要跑的指令。
+缺什麼，部署會停在 `preflight` 並告訴你缺哪幾項。
+
+**在專案 repo 裡跑**（這樣它讀得到 `.cicd/secrets.*`，自動把機密授權給新的 SA）：
 
 ```bash
-P=adamsourceinfo-dev          # prod 就換成 adamsourceinfo-prod
-SVC=my-app                    # Cloud Run 服務名
-SA=run-my-app                 # .cicd/config.yml 的 runtime_sa
-DB=my_app                     # .cicd/config.yml 的 db.name
-
-# 1. 執行身分
-gcloud iam service-accounts create "$SA" --project="$P" \
-  --display-name="runtime for $SVC" --quiet
-
-# 2. 連線路徑（只能綁專案層 —— 這不是隔離，見上一節）
-for R in roles/cloudsql.client roles/cloudsql.instanceUser; do
-  gcloud projects add-iam-policy-binding "$P" \
-    --member="serviceAccount:${SA}@${P}.iam.gserviceaccount.com" \
-    --role="$R" --condition=None --quiet
-done
-
-# 3. 讓部署身分能「使用」這個執行身分（deployer 不能改 IAM，所以要你來綁）
-gcloud iam service-accounts add-iam-policy-binding \
-  "${SA}@${P}.iam.gserviceaccount.com" --project="$P" \
-  --member="serviceAccount:github-deployer@${P}.iam.gserviceaccount.com" \
-  --role=roles/iam.serviceAccountUser --quiet
-
-# 4. 機密：這個服務的每個 secret 都要授權給「新的 SA」（見「設定與機密」）
-
-# 5. database 與 IAM DB user。
-#    IAM 使用者要用「去掉 .gserviceaccount.com」的短格式，否則 API 回 400。
-#    這個短格式正好就是 CI 注入的 DB_USER，兩邊必須逐字相同。
-gcloud sql databases create "$DB" --instance=apps-pg --project="$P" --quiet
-gcloud sql users create "${SA}@${P}.iam" --instance=apps-pg --project="$P" \
-  --type=cloud_iam_service_account --quiet
+cd my-app
+../ci/scripts/provision-service.sh my-app run-my-app my_app
+#                                  ↑服務名  ↑runtime_sa  ↑db.name
 ```
 
-**6. REVOKE / GRANT —— 這步不能省，省了隔離就是假的。**
+**預設兩個環境一起做。** 只想做一邊就加第四個參數 `dev` / `prod`。
+可以安全重跑——每一步先查再做。
 
-Postgres 15 之後 `public` schema 不再預設給 PUBLIC 建表權，但 **database 的
-CONNECT 仍然預設開給 PUBLIC**。共用 instance 下這代表任何服務都連得到任何
-database，所以一定要先 `REVOKE`。
+它做六件事：
 
-```bash
-# 內建 postgres 帳號預設沒密碼，設一個一次性的（IAM 認證的 app 不需要它）
-PGPASSWORD="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
-gcloud sql users set-password postgres --instance=apps-pg \
-  --project="$P" --password="$PGPASSWORD" --quiet
+| # | 做什麼 | 為什麼由人做 |
+|---|---|---|
+| 1 | 建執行身分 SA | deployer 沒有 `iam.*` |
+| 2 | 授 `cloudsql.client` + `cloudsql.instanceUser` | 同上。**循序**做，避免併發撞 etag |
+| 3 | 綁 deployer 的 `serviceAccountUser` | 沒有它 CI 用不了這個身分 |
+| 4 | 把 `.cicd/secrets.*` 的機密授權給新 SA | 換 SA 後最容易漏，漏了新 revision 直接起不來 |
+| 5 | 建 database 與 IAM DB user | DB user 要用去掉 `.gserviceaccount.com` 的短格式 |
+| 6 | `REVOKE CONNECT FROM PUBLIC` + 逐服務 `GRANT` | **省了隔離就是假的**，見上一節 |
 
-# 一定要連進「目標 database」—— 每個 database 有自己的 public schema，
-# 連到預設的 postgres 庫會成功但完全沒作用。
-cloud-sql-proxy "${P}:asia-east1:apps-pg" --port 5433 \
-  --token "$(gcloud auth print-access-token)" &
+結尾**驗收六項**，任一不過就非零結束：SA 存在、兩個角色、`serviceAccountUser`、
+database、DB user、`datacl` 的 PUBLIC 沒有 `c`。
 
-# proxy 要一兩秒才開始監聽。少了這一行，下面的 psql 會噴
-# 「connection to server at 127.0.0.1, port 5433 failed: Connection refused」。
-until nc -z 127.0.0.1 5433 2>/dev/null; do sleep 1; done
+**前三項是 CI 查不到的**——`getIamPolicy` 與 `cloudsql.users.list` 都不在部署身分
+的權限裡，而那條邊界比早幾十秒發現錯誤更值得守。所以它們只能在這裡驗。
 
-export PGPASSWORD
-psql -h 127.0.0.1 -p 5433 -U postgres -d "$DB" -v ON_ERROR_STOP=1 <<SQL
-REVOKE CONNECT ON DATABASE ${DB} FROM PUBLIC;
-GRANT ALL PRIVILEGES ON DATABASE ${DB} TO "${SA}@${P}.iam";
-GRANT ALL ON SCHEMA public TO "${SA}@${P}.iam";
-GRANT CONNECT ON DATABASE ${DB} TO "adamsourceinfo@gmail.com";
-SQL
-```
-
-最後一行把管理用的人工帳號連線權留回來——`REVOKE … FROM PUBLIC` 之後它也連不進去。
-
-> `--token` 不是多餘的：本機 ADC 過期時 proxy 會噴 `invalid_grant / invalid_rapt`，
-> 但 gcloud CLI 自己的憑證通常還好好的。
-
-驗證 `REVOKE` 真的生效——PUBLIC 那筆（開頭是 `=`）**不能有 `c`**：
-
-```bash
-psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -At -c \
-  "SELECT datname, array_to_string(datacl,' ') FROM pg_database WHERE datname='${DB}';"
-# 期望看到 =T/cloudsqlsuperuser（只有 TEMP，沒有 CONNECT）
-```
+> 腳本會重設 `postgres` 帳號的密碼。那是**拋棄式的**，不用記——IAM 認證的 app
+> 不需要它，下次跑又會換一個。
 
 開通完成後**要重新觸發一次部署**——先前那次已經失敗，不會自己重跑：
 
@@ -446,7 +421,7 @@ gh workflow run deploy.yml --repo adamsourceinfo-org/my-app --ref main
 （不要用 `gh run rerun`：它會沿用當初解析到的 ci workflow 版本。）
 
 > **停機省不了錢。** `--activation-policy=NEVER` 之後 compute 歸零，但 IP 保留費
-> （$0.01/hr ≈ $7.30/月）反而被啟用，加上照算的儲存費 $0.90 = $8.20，對照running
+> （$0.01/hr ≈ $7.30/月）反而被啟用，加上照算的儲存費 $0.90 = $8.20，對照 running
 > 的 $8.57 一個月只省 $0.37。關掉 public IP 也不行——那需要先設定 private IP。
 > 要省錢只有減少 instance 數量，這正是合併成一台的理由。
 
@@ -511,6 +486,15 @@ attribute.job_workflow_ref ==
 
 這兩者是安全邊界的一部分，不是風格。改動 `deploy.yml` 時務必保持。
 
+### PR 綠燈不代表部署會過
+
+`verify` 刻意沒有 GCP 憑證（見上節），所以 `runtime_sa` 指向不存在的 SA、
+database 還沒建這類問題，**PR 階段查不到**。最早的 GCP 檢查是 `preflight`，
+它在 merge 進 main 之後、build 之前跑。
+
+這是安全邊界的代價，不是疏漏：要讓 PR 查得到，就得讓 PR 拿得到雲端憑證，
+而那正是整個 WIF 設計要防的事。
+
 ---
 
 ## 常見錯誤
@@ -537,6 +521,8 @@ attribute.job_workflow_ref ==
 | `Database username ... without ".gserviceaccount.com"` | `sql users create` 要用短格式 `<runtime_sa>@<專案>.iam` |
 | `Invalid Tier (db-f1-micro) for (ENTERPRISE_PLUS)` | 建 instance 要加 `--edition=ENTERPRISE` |
 | proxy `invalid_grant / invalid_rapt` | 本機 ADC 過期。加 `--token "$(gcloud auth print-access-token)"` |
+| preflight `找不到 database「…」` / `找不到執行身分「…」` | 還沒 provision。跑 `ci/scripts/provision-service.sh` |
+| preflight `查不到… 沒有啟用 …googleapis.com` | 該專案缺 API，訊息裡直接附了 enable 指令 |
 | psql `Connection refused` on 127.0.0.1:5433 | `cloud-sql-proxy` 丟到背景後還沒開始監聽。等它：`until nc -z 127.0.0.1 5433; do sleep 1; done` |
 | `找不到執行身分「run-…」`，但 SA 明明存在 | 該專案沒開 `iam.googleapis.com`。owner 自己呼叫得動，所以手動測試不會暴露 |
 | 部署成功但 DB `InterfaceError: communication error` | SA 少了 `cloudsql.client` / `instanceUser`。併發下的 `add-iam-policy-binding` 可能靜靜掉一筆，複查 |

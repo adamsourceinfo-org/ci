@@ -159,6 +159,14 @@ jobs:
             echo "::error::服務名稱 '$SERVICE' 超過 49 字元。"
             exit 1
           fi
+          # smoke 是 "${URL%/}${HEALTH_PATH}" 直接字串相接，少一個斜線不會變成相對路徑，
+          # 會把主機名黏起來：health → https://<服務>.a.run.apphealth，curl 回
+          # 「Could not resolve host」。代價是白跑完整的 build + deploy，再等六次重試
+          # 六十秒才紅。沒有任何合法的 health_path 是不帶前導斜線的，擋在這裡。
+          if [ "${HEALTH_PATH#/}" = "$HEALTH_PATH" ]; then
+            echo "::error::health_path '${HEALTH_PATH}' 要以 / 開頭 —— smoke 是字串相接，少了斜線會黏成 <服務網址>${HEALTH_PATH}。"
+            exit 1
+          fi
           # /healthz 是 GCP 前端的保留路徑：在 *.run.app 上請求會被攔下來回 Google 自己的
           # 404，根本不會到容器（Cloud Run 的 request log 裡連那一筆都沒有）。smoke 打的
           # 永遠是 run.app 網址，所以這個值在這條管線上不可能通過。擋在 verify 而不是等
@@ -510,7 +518,7 @@ jobs:
             fi
             sleep 10
           done
-          echo "::error::dev 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。服務部署成功但沒有回應，請檢查應用程式是否有監聽 \$PORT。"
+          echo "::error::dev 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。服務部署成功但這個路徑沒有回應 —— 容器沒監聽 \$PORT，或 app 根本沒有 ${HEALTH_PATH} 這個路由。"
           exit 1
 
   # ── 5. resolve（只有 tag）──────────────────────────────────────────────────
@@ -711,5 +719,5 @@ jobs:
             fi
             sleep 10
           done
-          echo "::error::prod 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。"
+          echo "::error::prod 健康檢查失敗（最後一次 HTTP ${CODE}，目標 ${TARGET}）。跑的是 dev 驗過的同一個 image，所以差異只可能來自 prod 端 —— 設定、機密、或 database。"
           exit 1

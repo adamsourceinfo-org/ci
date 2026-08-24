@@ -272,7 +272,10 @@ db:                        # 要用 Cloud SQL 才需要，只宣告一次
 | `APP_ENV`、DB 連線 | — | CI 依部署目標注入 |
 | `APP_VERSION` | — | **只有 prod 注入**（值是 tag）。dev 不注入，app 端自己給預設值 |
 
-寫一個機密的值 —— 這是開發時的事，跟 CI 無關：
+寫一個機密的值 —— 這是開發時的事，跟 CI 無關。**新服務不用照這段做第三步**：
+`provision-service.sh` 會讀 `.cicd/secrets.*` 自動把機密授權給新的執行身分（它的第 4 步），
+所以只要先把 secret 建好再跑腳本就行。下面完整寫出來是給**既有服務加一個新機密**用的 ——
+那時候腳本已經跑過了，沒有人會替你補授權。
 
 ```bash
 gcloud secrets create my-app-api-key-dev --replication-policy=automatic --project=adamsourceinfo-dev
@@ -515,6 +518,7 @@ database 還沒建這類問題，**PR 階段查不到**。最早的 GCP 檢查�
 | `複製後 digest 不一致` | promote 的重點就是逐位元組相同，不一致必須中止 |
 | dev 健康檢查失敗 | 容器沒監聽 `$PORT`（Cloud Run 注入，預設 8080） |
 | `health_path 不可以是 /healthz` | GCP 前端保留路徑，見「專案端契約」的警告。改用 `/health` |
+| `health_path '…' 要以 / 開頭` | smoke 是字串相接，少了斜線會黏成 `<服務網址>health` 而不是路徑 |
 | smoke 回 404，但 `/` 打得到、request log 裡沒有那一筆 | 打到 `/healthz` 之類的保留路徑，請求沒進容器 |
 | `找不到共用 Cloud SQL instance` | 該環境還沒開 `apps-pg`。見「開共用 instance」 |
 | `找不到執行身分「run-…」` | SA 還沒建。照「一次性清單」跑一次 |
@@ -532,7 +536,8 @@ database 還沒建這類問題，**PR 階段查不到**。最早的 GCP 檢查�
 | proxy `invalid_grant / invalid_rapt` | 本機 ADC 過期。加 `--token "$(gcloud auth print-access-token)"` |
 | preflight `找不到 database「…」` / `找不到執行身分「…」` | 還沒 provision。跑 `ci/scripts/provision-service.sh` |
 | preflight `查不到… 沒有啟用 …googleapis.com` | 該專案缺 API，訊息裡直接附了 enable 指令 |
-| psql `Connection refused` on 127.0.0.1:5433 | `cloud-sql-proxy` 丟到背景後還沒開始監聽。等它：`until nc -z 127.0.0.1 5433; do sleep 1; done` |
+| psql `Connection refused` | `cloud-sql-proxy` 丟到背景後還沒開始監聽。等它：`until nc -z 127.0.0.1 "$PORT"; do sleep 1; done` |
+| psql `server closed the connection unexpectedly`，但 proxy 看起來有起來 | **port 被別的 proxy 佔住了**，`nc -z` 探到的是別人的 —— 於是等待通過、psql 卻連到不相干的 instance。真正的錯誤只在 proxy log 裡：`bind: address already in use`。別用固定的 5433，照 `provision-service.sh` 用 `PORT=$(( 5500 + RANDOM % 400 ))` |
 | `找不到執行身分「run-…」`，但 SA 明明存在 | 該專案沒開 `iam.googleapis.com`。owner 自己呼叫得動，所以手動測試不會暴露 |
 | 部署成功但 DB `InterfaceError: communication error` | SA 少了 `cloudsql.client` / `instanceUser`。併發下的 `add-iam-policy-binding` 可能靜靜掉一筆，複查 |
 | 自己用 psql 看不到 app 建的表 | 表的擁有者是服務的 SA。`GRANT "<runtime_sa>@<專案>.iam" TO "<你的帳號>"` |

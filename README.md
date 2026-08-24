@@ -452,7 +452,7 @@ DB 回答。合併之後 `instance` 兩邊都是 `apps-pg`，所以真正證明�
 | 一個環境只有一台 instance | 專案端無法指定別台。真的需要就手動 `--add-cloudsql-instances`，疊加式旗標與 CI 並存不衝突 |
 | 兩個環境的 instance 名字相同 | 刻意的 —— 分歧的餘地就是出錯的餘地，環境靠 project ID 識別 |
 | 服務共用 instance 的連線數 | `db-f1-micro` 預設 `max_connections=25`，四個服務共用。撞到時：調小 `DB_POOL_MAX` / `maxScale` → 設 `max_connections` flag → 升 `db-g1-small` |
-| 刪掉 `db:` | ⚠️ 掛載不會自動消失，要手動 `--remove-cloudsql-instances` |
+| 刪掉 `db:` | ⚠️ 掛載**和環境變數都不會**自動消失。服務會退回 `run-runtime`，但 app 仍看得到 `INSTANCE_CONNECTION_NAME` 而去連 DB，然後失敗（`run-runtime` 沒有 cloudsql 權限）。實測確認過。要手動清：`gcloud run services update <svc> --remove-cloudsql-instances=<專案>:asia-east1:apps-pg --remove-env-vars=INSTANCE_CONNECTION_NAME,DB_USER,DB_NAME` |
 | 改 `runtime_sa` | ⚠️ 舊 SA 的 secret 授權不會自動搬，新 SA 要重新授權 |
 
 ---

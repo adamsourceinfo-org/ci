@@ -89,8 +89,9 @@ permissions: {contents: read, id-token: write}
 沒有宣告 `db:` 的服務整個 job 被 `if` 跳過——零成本。
 
 目標專案依 `github.ref_type` 決定（`branch`→dev、`tag`→prod）。
-在 dev 路徑額外對 prod 做**非阻斷**檢查並以 `::warning::` 回報，
-因為「prod 忘了 provision」現在只有打 tag 時才會發現。
+**刻意不順便檢查 prod**：這個 job 拿的是本環境的憑證，看不到另一個專案，
+加上去只會變成每次都警告，而每次都出現的警告等於沒有警告。
+「prod 忘了 provision」的根因由 `provision-service.sh` 預設做兩個環境解決。
 
 檢查三項，全部跑完再一次回報：
 
@@ -148,14 +149,14 @@ SA 存在、兩個角色、serviceAccountUser、database、DB user、`datacl` �
 1. **行為不變**：`hello-probe` 推一次 main，dev 部署結果與改動前逐字相同
 2. **preflight 擋得住**：`hello-probe` 的 `db.name` 改成不存在的值，
    應在 build-push **之前**失敗，且訊息同時列出缺的 database
-3. **API 訊息**：暫時停用測試專案的 `iam.googleapis.com`，preflight 應說
-   「沒開 API」而不是「找不到 SA」（驗完立刻開回）
-4. **prod 預警**：dev 路徑對尚未 provision 的 prod 給 `::warning::` 而非失敗
-5. **無 DB 路徑**（從未被執行過）：`hello-probe` 暫時拿掉 `db:`，
+3. **API 訊息的解析邏輯**：不去停用正在用的 API（會波及其他服務）。
+   改用真實的 `SERVICE_DISABLED` 錯誤字串在本機餵給同一段 `grep -E`，
+   確認它挑得出 API 名稱並走「沒開 API」那條分支
+4. **無 DB 路徑**（從未被執行過）：`hello-probe` 暫時拿掉 `db:`，
    應跳過 preflight、用 `run-runtime` 部署成功、健康檢查回報 `configured: false`
-6. **腳本冪等**：對已 provision 好的 `hello-probe` 重跑 `provision-service.sh`，
+5. **腳本冪等**：對已 provision 好的 `hello-probe` 重跑 `provision-service.sh`，
    應全部略過並通過六項驗收
-7. **腳本抓得到破壞**：手動撤掉 `run-hello-probe` 的一個 cloudsql 角色，
+6. **腳本抓得到破壞**：手動撤掉 `run-hello-probe` 的一個 cloudsql 角色，
    重跑腳本應補回並在驗收中指出
-8. **tag 路徑**：`hello-probe` 打新 tag，prod 部署成功
-9. **AR policy**：`--dry-run` 的刪除清單只含預期項目
+7. **tag 路徑**：`hello-probe` 打新 tag，prod 部署成功
+8. **AR policy**：`--dry-run` 的刪除清單只含預期項目

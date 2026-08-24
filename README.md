@@ -55,6 +55,22 @@ gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
 gcloud artifacts repositories create "$AR_REPO" --repository-format=docker \
   --location="$REGION" --project="$PROJECT" --quiet
 
+#    清理政策。每次 push 都新增一個 image，沒有回收的話只會單向成長。
+#    Keep 規則優先於 Delete，而 keepCount 是「每個 image 各保留 N 個」——
+#    所以久未部署的服務，它正在跑的那個 image 仍在最新 10 個之內，不會被刪。
+cat > /tmp/ar-policy.json <<'JSON'
+[
+  {"name":"keep-recent","action":{"type":"Keep"},
+   "mostRecentVersions":{"keepCount":10}},
+  {"name":"delete-untagged-30d","action":{"type":"Delete"},
+   "condition":{"tagState":"untagged","olderThan":"30d"}},
+  {"name":"delete-old-90d","action":{"type":"Delete"},
+   "condition":{"tagState":"any","olderThan":"90d"}}
+]
+JSON
+gcloud artifacts repositories set-cleanup-policies "$AR_REPO" \
+  --location="$REGION" --project="$PROJECT" --policy=/tmp/ar-policy.json --no-dry-run
+
 # 3. 兩個身分。執行身分刻意「不是」預設 compute SA —— 那個帶 Editor，
 #    等於每個服務都是專案管理員。
 #    run-runtime 是「沒有自己資料庫的服務」的預設執行身分，它刻意沒有任何

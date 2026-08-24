@@ -411,6 +411,10 @@ gcloud sql users set-password postgres --instance=apps-pg \
 cloud-sql-proxy "${P}:asia-east1:apps-pg" --port 5433 \
   --token "$(gcloud auth print-access-token)" &
 
+# proxy 要一兩秒才開始監聽。少了這一行，下面的 psql 會噴
+# 「connection to server at 127.0.0.1, port 5433 failed: Connection refused」。
+until nc -z 127.0.0.1 5433 2>/dev/null; do sleep 1; done
+
 export PGPASSWORD
 psql -h 127.0.0.1 -p 5433 -U postgres -d "$DB" -v ON_ERROR_STOP=1 <<SQL
 REVOKE CONNECT ON DATABASE ${DB} FROM PUBLIC;
@@ -533,6 +537,7 @@ attribute.job_workflow_ref ==
 | `Database username ... without ".gserviceaccount.com"` | `sql users create` 要用短格式 `<runtime_sa>@<專案>.iam` |
 | `Invalid Tier (db-f1-micro) for (ENTERPRISE_PLUS)` | 建 instance 要加 `--edition=ENTERPRISE` |
 | proxy `invalid_grant / invalid_rapt` | 本機 ADC 過期。加 `--token "$(gcloud auth print-access-token)"` |
+| psql `Connection refused` on 127.0.0.1:5433 | `cloud-sql-proxy` 丟到背景後還沒開始監聽。等它：`until nc -z 127.0.0.1 5433; do sleep 1; done` |
 | `找不到執行身分「run-…」`，但 SA 明明存在 | 該專案沒開 `iam.googleapis.com`。owner 自己呼叫得動，所以手動測試不會暴露 |
 | 部署成功但 DB `InterfaceError: communication error` | SA 少了 `cloudsql.client` / `instanceUser`。併發下的 `add-iam-policy-binding` 可能靜靜掉一筆，複查 |
 | 自己用 psql 看不到 app 建的表 | 表的擁有者是服務的 SA。`GRANT "<runtime_sa>@<專案>.iam" TO "<你的帳號>"` |

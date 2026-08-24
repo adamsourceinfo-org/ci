@@ -176,7 +176,14 @@ jobs:
             echo "db_name=$DB_NAME"
           } >> "$GITHUB_OUTPUT"
           echo "✅ service=$SERVICE  region=$REGION  dockerfile=$DOCKERFILE  sha=${GITHUB_SHA:0:7}"
-          [ -n "$DB_NAME" ] && echo "   Cloud SQL：${SQL_INSTANCE} / ${DB_NAME}（執行身分 ${RUNTIME_SA}）"
+          # 這裡要用 if 而不是 `[ -n … ] && echo …`：後者在 DB_NAME 為空時回傳 1，
+          # 而它是這個 step 的最後一個指令，set -e 會讓整個 step 以失敗收場。
+          # 這個 bug 潛伏很久 —— 因為每個服務都宣告了 db，沒有 DB 的路徑從沒被跑過。
+          if [ -n "$DB_NAME" ]; then
+            echo "   Cloud SQL：${SQL_INSTANCE} / ${DB_NAME}（執行身分 ${RUNTIME_SA}）"
+          else
+            echo "   沒有宣告 db —— 執行身分用共用的 ${RUNTIME_SA}"
+          fi
 
       - name: 檢查 .cicd 設定契約
         run: |

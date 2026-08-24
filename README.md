@@ -21,6 +21,7 @@ digest 就變了），複製完還會比對 digest，不一致就中止。
 | 誰 | 做什麼 | 多久一次 | 用什麼憑證 |
 |---|---|---|---|
 | **你（owner）** | GCP 專案、API、WIF、SA、IAM、Cloud SQL instance | 一次 | 你自己的 `gcloud` |
+| **你（owner）** | 服務的執行身分 SA、database、`GRANT` | 每個要用 DB 的服務一次 | 你自己的 `gcloud` |
 | **你（owner）** | 建 repo、分支保護 | 每個新專案一次 | 你自己的 `gh` |
 | **開發者** | 程式碼、`.cicd/` 設定、secret 的**值** | 日常 | 自己的 |
 | **CI（本 repo）** | build → deploy → 掛設定 → smoke | 每次 push | WIF 換來的**短期**憑證 |
@@ -52,6 +53,8 @@ gcloud artifacts repositories create "$AR_REPO" --repository-format=docker \
 
 # 3. 兩個身分。執行身分刻意「不是」預設 compute SA —— 那個帶 Editor，
 #    等於每個服務都是專案管理員。
+#    run-runtime 是「沒有自己資料庫的服務」的預設執行身分，它刻意沒有任何
+#    Cloud SQL 權限 —— 要用 DB 的服務要有自己的 SA，見「服務要用資料庫」。
 gcloud iam service-accounts create run-runtime      --project="$PROJECT" --quiet
 gcloud iam service-accounts create github-deployer  --project="$PROJECT" --quiet
 
@@ -96,6 +99,29 @@ gcloud artifacts repositories add-iam-policy-binding apps \
 
 > 剛建好的 SA 不會立刻出現在 IAM policy API，`add-iam-policy-binding` 可能回
 > "does not exist"。等幾秒重試即可。
+
+### 開共用 instance（每個環境一台）
+
+**一個環境一台，服務靠 database 分隔。** 收費按 instance 算、database 免費，
+所以「一個服務一台」是純粹的浪費。名字兩個環境都叫 `apps-pg`——環境靠 project ID
+識別，`connectionName` 前面就是它。
+
+```bash
+# --edition=ENTERPRISE 不能省：新 instance 預設 ENTERPRISE_PLUS，那個版本不收
+# db-f1-micro 這類共享核心規格，會噴 Invalid Tier。
+gcloud sql instances create apps-pg --project="$PROJECT" --region="$REGION" \
+  --edition=ENTERPRISE --database-version=POSTGRES_17 --tier=db-f1-micro \
+  --storage-size=10 --storage-type=HDD \
+  --database-flags=cloudsql.iam_authentication=on \
+  --backup-start-time=18:00 --quiet
+
+# 管理用的人工帳號，之後每個 database 都要單獨 GRANT CONNECT 給它
+gcloud sql users create adamsourceinfo@gmail.com --instance=apps-pg \
+  --project="$PROJECT" --type=cloud_iam_user
+```
+
+`--backup-start-time` 順手開備份（時間是 UTC，18:00 = 台北 02:00）。備份費是
+$0.08/GiB-月，這種規模等於幾分錢，沒有不開的理由。
 
 ---
 
@@ -182,10 +208,13 @@ health_path: /healthz      # 預設 /
 dockerfile: Dockerfile
 allow_unauthenticated: true
 
+runtime_sa: run-my-app     # 執行身分。要用 Cloud SQL 就必填
 db:                        # 要用 Cloud SQL 才需要，只宣告一次
-  instance: my-app-pg
-  name: my_app
+  name: my_app             # instance 由平台決定（一個環境一台 apps-pg）
 ```
+
+**`runtime_sa` 在宣告 `db` 時必填。** 共用的 `run-runtime` 沒有 Cloud SQL 權限
+——「你有自己的資料庫，就有自己的身分」。不用 DB 的服務整段省略，沿用 `run-runtime`。
 
 打錯的 key 會被擋下並列出可用名字 —— 設定檔最常見的失敗是「明明寫了卻沒生效」。
 
@@ -208,9 +237,13 @@ db:                        # 要用 Cloud SQL 才需要，只宣告一次
 gcloud secrets create my-app-api-key-dev --replication-policy=automatic --project=adamsourceinfo-dev
 printf '%s' "$VALUE" | gcloud secrets versions add my-app-api-key-dev --data-file=- --project=adamsourceinfo-dev
 gcloud secrets add-iam-policy-binding my-app-api-key-dev --project=adamsourceinfo-dev \
-  --member="serviceAccount:run-runtime@adamsourceinfo-dev.iam.gserviceaccount.com" \
+  --member="serviceAccount:run-my-app@adamsourceinfo-dev.iam.gserviceaccount.com" \
   --role=roles/secretmanager.secretAccessor
 ```
+
+> ⚠️ 授權對象是**這個服務的 `runtime_sa`**，不是共用的 `run-runtime`。從共用身分改成
+> 專屬身分時最容易漏這一步 —— 漏了的話新 revision 讀不到機密、**直接起不來**，
+> 而且是在切換當下才炸。
 
 然後在 `.cicd/secrets.dev` 加一行 `API_KEY=my-app-api-key-dev:latest`。
 
@@ -236,11 +269,14 @@ gcloud secrets add-iam-policy-binding my-app-api-key-dev --project=adamsourceinf
 
 ## 服務要用資料庫
 
+**一個環境一台 instance（`apps-pg`），服務靠 database 分隔。** 收費按 instance 算，
+instance 裡開幾個 database 免費——所以「一個服務一台」是純粹的浪費。
+
 在 `.cicd/config.yml` 宣告**一次**（不是 dev/prod 各一份）：
 
 ```yaml
+runtime_sa: run-my-app
 db:
-  instance: my-app-pg
   name: my_app
 ```
 
@@ -248,19 +284,33 @@ db:
 
 | CI 注入的環境變數 | 推導方式 | dev 實際拿到 |
 |---|---|---|
-| `INSTANCE_CONNECTION_NAME` | `<專案>:<區域>:<db.instance>` | `adamsourceinfo-dev:asia-east1:my-app-pg` |
-| `DB_USER` | `run-runtime@<專案>.iam` | `run-runtime@adamsourceinfo-dev.iam` |
+| `INSTANCE_CONNECTION_NAME` | `<專案>:<區域>:apps-pg` | `adamsourceinfo-dev:asia-east1:apps-pg` |
+| `DB_USER` | `<runtime_sa>@<專案>.iam` | `run-my-app@adamsourceinfo-dev.iam` |
+| `DB_NAME` | `db.name` 原樣 | `my_app` |
 
 **為什麼不讓你自己寫連線字串**：那樣就有寫錯專案的機會。CI 本來就知道自己在部署哪個環境
 （它已經用這個知識注入 `APP_ENV`），讓它一併推導，dev 連到 prod 的 DB 就從「會被抓到的錯」
-變成**寫不出來的錯**。
+變成**寫不出來的錯**。instance 同理——專案端根本沒有那個欄位。
 
 > `INSTANCE_CONNECTION_NAME`、`DB_USER`、`DB_INSTANCE`、`DB_NAME` 在 `.cicd/env.*` 裡都被擋下。
 
+### 隔離只來自 GRANT，不來自 IAM
+
+四個服務共用一台 instance，所以每個 SA 都登得進去——`roles/cloudsql.client` 與
+`roles/cloudsql.instanceUser` **只能綁在專案層**（Cloud SQL 沒有 instance 層級的
+IAM policy，`gcloud sql instances add-iam-policy-binding` 這個指令不存在）。
+
+這兩個角色不是防護，是**連線路徑本身**：少了 `client`，Cloud Run 旁的 Auth Proxy
+建不起連線；少了 `instanceUser`，access token 不被當成密碼接受。
+
+**真正的牆是 Postgres 的 `REVOKE CONNECT ON DATABASE … FROM PUBLIC`。**
+Postgres 預設讓 `PUBLIC` 連任何 database，少了那道 `REVOKE`，每服務一個 SA
+只是換了名字，隔離是假的。這是下面清單裡最不能省的一步。
+
 ### 沒有密碼
 
-用 Cloud SQL **IAM 資料庫認證**：`run-runtime` SA 直接就是 Postgres 使用者，密碼是向
-metadata server 要的 access token。Secret Manager 不放任何 DB 機密。
+用 Cloud SQL **IAM 資料庫認證**：服務自己的 SA（`runtime_sa`）直接就是 Postgres 使用者，
+密碼是向 metadata server 要的 access token。Secret Manager 不放任何 DB 機密。
 
 app 端要裝一個 Postgres driver。純 Python 的 `pg8000` 在 alpine 上不用編譯：
 
@@ -290,58 +340,84 @@ conn = pg8000.dbapi.connect(
 )
 ```
 
-### 開 instance（你，一次性）
+### 一次性清單（你，每個服務、每個環境各跑一次）
 
-**CI 刻意不自動建 instance** —— 要 10 分鐘、會計費，而且 `config.yml` 打錯一個字就多開一台。
-沒有的話部署會停在 `verify` 之後並印出該跑的指令。（Cloud Run service 本身則相反：
-`gcloud run deploy` 沒有就建、有就更新。）
+**CI 刻意不自動做這些。** instance 要 10 分鐘且會計費；SA 更關鍵——一個能建 SA
+又能發角色的部署身分，等於能把任何權限發給自己，WIF 那道「只有一支 workflow
+換得到憑證」的鎖就白做了。所以 `github-deployer` 沒有任何 `iam.*` 權限。
+缺什麼，部署會停在該步並印出要跑的指令。
 
 ```bash
-PROJECT=adamsourceinfo-dev; INSTANCE=my-app-pg; DB=my_app
+P=adamsourceinfo-dev          # prod 就換成 adamsourceinfo-prod
+SVC=my-app                    # Cloud Run 服務名
+SA=run-my-app                 # .cicd/config.yml 的 runtime_sa
+DB=my_app                     # .cicd/config.yml 的 db.name
 
-# --edition=ENTERPRISE 不能省：新 instance 預設 ENTERPRISE_PLUS，那個版本不收
-# db-f1-micro 這類共享核心規格，會噴 Invalid Tier。
-gcloud sql instances create "$INSTANCE" --project="$PROJECT" --region=asia-east1 \
-  --edition=ENTERPRISE --database-version=POSTGRES_17 --tier=db-f1-micro \
-  --storage-size=10 --storage-type=HDD \
-  --database-flags=cloudsql.iam_authentication=on --quiet
+# 1. 執行身分
+gcloud iam service-accounts create "$SA" --project="$P" \
+  --display-name="runtime for $SVC" --quiet
 
-gcloud sql databases create "$DB" --instance="$INSTANCE" --project="$PROJECT"
-
-# IAM 使用者要用「去掉 .gserviceaccount.com」的短格式，否則 API 回 400。
-# 這個短格式正好就是 CI 注入的 DB_USER，兩邊必須逐字相同。
-gcloud sql users create "run-runtime@${PROJECT}.iam" --instance="$INSTANCE" \
-  --project="$PROJECT" --type=cloud_iam_service_account
-
+# 2. 連線路徑（只能綁專案層 —— 這不是隔離，見上一節）
 for R in roles/cloudsql.client roles/cloudsql.instanceUser; do
-  gcloud projects add-iam-policy-binding "$PROJECT" \
-    --member="serviceAccount:run-runtime@${PROJECT}.iam.gserviceaccount.com" \
+  gcloud projects add-iam-policy-binding "$P" \
+    --member="serviceAccount:${SA}@${P}.iam.gserviceaccount.com" \
     --role="$R" --condition=None --quiet
 done
+
+# 3. 讓部署身分能「使用」這個執行身分（deployer 不能改 IAM，所以要你來綁）
+gcloud iam service-accounts add-iam-policy-binding \
+  "${SA}@${P}.iam.gserviceaccount.com" --project="$P" \
+  --member="serviceAccount:github-deployer@${P}.iam.gserviceaccount.com" \
+  --role=roles/iam.serviceAccountUser --quiet
+
+# 4. 機密：這個服務的每個 secret 都要授權給「新的 SA」（見「設定與機密」）
+
+# 5. database 與 IAM DB user。
+#    IAM 使用者要用「去掉 .gserviceaccount.com」的短格式，否則 API 回 400。
+#    這個短格式正好就是 CI 注入的 DB_USER，兩邊必須逐字相同。
+gcloud sql databases create "$DB" --instance=apps-pg --project="$P" --quiet
+gcloud sql users create "${SA}@${P}.iam" --instance=apps-pg --project="$P" \
+  --type=cloud_iam_service_account --quiet
 ```
 
-Postgres 15 之後 `public` schema 不再預設給 PUBLIC 建表權，所以**還要 `GRANT`**：
+**6. REVOKE / GRANT —— 這步不能省，省了隔離就是假的。**
+
+Postgres 15 之後 `public` schema 不再預設給 PUBLIC 建表權，但 **database 的
+CONNECT 仍然預設開給 PUBLIC**。共用 instance 下這代表任何服務都連得到任何
+database，所以一定要先 `REVOKE`。
 
 ```bash
 # 內建 postgres 帳號預設沒密碼，設一個一次性的（IAM 認證的 app 不需要它）
 PGPASSWORD="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
-gcloud sql users set-password postgres --instance="$INSTANCE" \
-  --project="$PROJECT" --password="$PGPASSWORD" --quiet
+gcloud sql users set-password postgres --instance=apps-pg \
+  --project="$P" --password="$PGPASSWORD" --quiet
 
 # 一定要連進「目標 database」—— 每個 database 有自己的 public schema，
 # 連到預設的 postgres 庫會成功但完全沒作用。
-cloud-sql-proxy "${PROJECT}:asia-east1:${INSTANCE}" --port 5433 \
+cloud-sql-proxy "${P}:asia-east1:apps-pg" --port 5433 \
   --token "$(gcloud auth print-access-token)" &
 
 export PGPASSWORD
-psql -h 127.0.0.1 -p 5433 -U postgres -d "$DB" <<SQL
-GRANT ALL ON SCHEMA public TO "run-runtime@${PROJECT}.iam";
-GRANT ALL PRIVILEGES ON DATABASE ${DB} TO "run-runtime@${PROJECT}.iam";
+psql -h 127.0.0.1 -p 5433 -U postgres -d "$DB" -v ON_ERROR_STOP=1 <<SQL
+REVOKE CONNECT ON DATABASE ${DB} FROM PUBLIC;
+GRANT ALL PRIVILEGES ON DATABASE ${DB} TO "${SA}@${P}.iam";
+GRANT ALL ON SCHEMA public TO "${SA}@${P}.iam";
+GRANT CONNECT ON DATABASE ${DB} TO "adamsourceinfo@gmail.com";
 SQL
 ```
 
+最後一行把管理用的人工帳號連線權留回來——`REVOKE … FROM PUBLIC` 之後它也連不進去。
+
 > `--token` 不是多餘的：本機 ADC 過期時 proxy 會噴 `invalid_grant / invalid_rapt`，
 > 但 gcloud CLI 自己的憑證通常還好好的。
+
+驗證 `REVOKE` 真的生效——PUBLIC 那筆（開頭是 `=`）**不能有 `c`**：
+
+```bash
+psql -h 127.0.0.1 -p 5433 -U postgres -d postgres -At -c \
+  "SELECT datname, array_to_string(datacl,' ') FROM pg_database WHERE datname='${DB}';"
+# 期望看到 =T/cloudsqlsuperuser（只有 TEMP，沒有 CONNECT）
+```
 
 開通完成後**要重新觸發一次部署**——先前那次已經失敗，不會自己重跑：
 
@@ -351,11 +427,10 @@ gh workflow run deploy.yml --repo adamsourceinfo-org/my-app --ref main
 
 （不要用 `gh run rerun`：它會沿用當初解析到的 ci workflow 版本。）
 
-dev 不用時可停機，只算儲存費：
-
-```bash
-gcloud sql instances patch my-app-pg --project=adamsourceinfo-dev --activation-policy=NEVER
-```
+> **停機省不了錢。** `--activation-policy=NEVER` 之後 compute 歸零，但 IP 保留費
+> （$0.01/hr ≈ $7.30/月）反而被啟用，加上照算的儲存費 $0.90 = $8.20，對照running
+> 的 $8.57 一個月只省 $0.37。關掉 public IP 也不行——那需要先設定 private IP。
+> 要省錢只有減少 instance 數量，這正是合併成一台的理由。
 
 ### 怎麼確認接對了
 
@@ -364,23 +439,28 @@ gcloud sql instances patch my-app-pg --project=adamsourceinfo-dev --activation-p
 
 ```json
 { "env": "dev",
-  "db": { "instance": "adamsourceinfo-dev:asia-east1:my-app-pg",
+  "db": { "instance": "adamsourceinfo-dev:asia-east1:apps-pg",
           "ok": true,
-          "server_user": "run-runtime@adamsourceinfo-dev.iam",
+          "server_user": "run-my-app@adamsourceinfo-dev.iam",
           "database": "my_app" } }
 ```
 
 dev 與 prod 各打一次，專案名要各自對得上自己的環境。兩邊跑的是同一個 image，
 所以差異只可能來自 CI 推導 —— 這正是重點。
 
+`server_user` 是**這個服務自己的 SA**、`database` 是自己的 database，兩個都由
+DB 回答。合併之後 `instance` 兩邊都是 `apps-pg`，所以真正證明隔離的是這兩個欄位。
+
 ### 限制
 
 | 限制 | 說明 |
 |---|---|
-| DB 與 Cloud Run 必須同區域 | 推導假設 `<專案>:asia-east1:<instance>` |
-| 不支援跨專案 / 跨區域的 DB | 手動 `--add-cloudsql-instances`，疊加式旗標與 CI 並存不衝突 |
-| 兩個環境的 instance 名字不能不同 | 刻意的 —— 分歧的餘地就是出錯的餘地 |
+| DB 與 Cloud Run 必須同區域 | 推導假設 `<專案>:asia-east1:apps-pg` |
+| 一個環境只有一台 instance | 專案端無法指定別台。真的需要就手動 `--add-cloudsql-instances`，疊加式旗標與 CI 並存不衝突 |
+| 兩個環境的 instance 名字相同 | 刻意的 —— 分歧的餘地就是出錯的餘地，環境靠 project ID 識別 |
+| 服務共用 instance 的連線數 | `db-f1-micro` 預設 `max_connections=25`，四個服務共用。撞到時：調小 `DB_POOL_MAX` / `maxScale` → 設 `max_connections` flag → 升 `db-g1-small` |
 | 刪掉 `db:` | ⚠️ 掛載不會自動消失，要手動 `--remove-cloudsql-instances` |
+| 改 `runtime_sa` | ⚠️ 舊 SA 的 secret 授權不會自動搬，新 SA 要重新授權 |
 
 ---
 
@@ -398,8 +478,9 @@ attribute.job_workflow_ref ==
 | | dev | prod |
 |---|---|---|
 | 部署身分 | `github-deployer@adamsourceinfo-dev` | `github-deployer@adamsourceinfo-prod` |
-| 執行身分 | `run-runtime@adamsourceinfo-dev` | `run-runtime@adamsourceinfo-prod` |
-| 部署權限 | `run.admin`、`artifactregistry.writer`、`cloudsql.viewer`、`serviceAccountUser`（限執行身分） | 同左 + dev AR 的 `artifactregistry.reader` |
+| 執行身分（有 DB） | `<runtime_sa>@adamsourceinfo-dev` | `<runtime_sa>@adamsourceinfo-prod` |
+| 執行身分（沒有 DB） | `run-runtime@adamsourceinfo-dev` | `run-runtime@adamsourceinfo-prod` |
+| 部署權限 | `run.admin`、`artifactregistry.writer`、`cloudsql.viewer`、`serviceAccountUser`（限**各個**執行身分，逐一綁定） | 同左 + dev AR 的 `artifactregistry.reader` |
 
 **部署身分沒有 `iam.*`** —— 建 SA、授 IAM 都做不到。所以上面那份 runbook 才必須由人跑。
 
@@ -424,11 +505,17 @@ attribute.job_workflow_ref ==
 | `在 dev AR 找不到 sha-xxxxxxx` | 這個 commit 沒走過 main pipeline |
 | `複製後 digest 不一致` | promote 的重點就是逐位元組相同，不一致必須中止 |
 | dev 健康檢查失敗 | 容器沒監聽 `$PORT`（Cloud Run 注入，預設 8080） |
-| `找不到 Cloud SQL instance` | 還沒開通。見「開 instance」 |
-| `不可以自己設定 INSTANCE_CONNECTION_NAME` | CI 保留字。改在 `config.yml` 宣告 `db` |
+| `找不到共用 Cloud SQL instance` | 該環境還沒開 `apps-pg`。見「開共用 instance」 |
+| `找不到執行身分「run-…」` | SA 還沒建。照「一次性清單」跑一次 |
+| `宣告了 db 就必須指定 runtime_sa` | 共用的 `run-runtime` 沒有 Cloud SQL 權限，要用 DB 就要有自己的身分 |
+| `runtime_sa '…' 不是合法的 service account ID` | 6–30 字元、小寫字母開頭，只能有小寫字母/數字/連字號 |
+| `db.instance 已移除` | 舊格式。刪掉那行，只留 `db.name` |
+| `不可以自己設定 INSTANCE_CONNECTION_NAME` | CI 保留字。改在 `config.yml` 宣告 `db.name` 與 `runtime_sa` |
 | `Bad syntax for dict arg` | `.cicd/*` 的值裡有 `@@`，撞到自訂分隔符 |
 | 部署時 `Aborted by user` | 該專案的 `sqladmin.googleapis.com` 沒開 |
 | `permission denied for schema public` | IAM 使用者建了但沒 `GRANT`，或 `GRANT` 下在別的 database |
-| `Database username ... without ".gserviceaccount.com"` | `sql users create` 要用短格式 `run-runtime@<專案>.iam` |
+| `permission denied for database` | 漏了 `GRANT CONNECT`，或 `runtime_sa` 指到別的服務的 SA（fail closed，不會讀到別人的資料） |
+| Cloud Run revision 起不來、讀不到 secret | 換 `runtime_sa` 之後漏了 secret accessor 授權 |
+| `Database username ... without ".gserviceaccount.com"` | `sql users create` 要用短格式 `<runtime_sa>@<專案>.iam` |
 | `Invalid Tier (db-f1-micro) for (ENTERPRISE_PLUS)` | 建 instance 要加 `--edition=ENTERPRISE` |
 | proxy `invalid_grant / invalid_rapt` | 本機 ADC 過期。加 `--token "$(gcloud auth print-access-token)"` |

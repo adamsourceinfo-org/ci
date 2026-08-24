@@ -238,7 +238,7 @@ my-app/
 ```yaml
 service: my-app            # 預設用 repo 名稱
 region: asia-east1
-health_path: /healthz      # 預設 /
+health_path: /health       # 預設 /。不要用 /healthz，見下面的警告
 dockerfile: Dockerfile
 allow_unauthenticated: true
 
@@ -246,6 +246,12 @@ runtime_sa: run-my-app     # 執行身分。要用 Cloud SQL 就必填
 db:                        # 要用 Cloud SQL 才需要，只宣告一次
   name: my_app             # instance 由平台決定（一個環境一台 apps-pg）
 ```
+
+> ⚠️ **`health_path` 不可以是 `/healthz`。** 那是 GCP 前端的保留路徑：在 `*.run.app` 上
+> 請求會被攔下來回 Google 自己的 404 頁，**根本不會到你的容器**（Cloud Run 的 request log
+> 裡連那一筆都沒有）。症狀特別會誤導 —— `/` 打得到、服務 Ready、smoke 卻紅，而錯誤訊息
+> 講的是「檢查有沒有監聽 `$PORT`」。`verify` 已經會擋下這個值。只有**精確**的 `/healthz`
+> 被攔，`/health`、`/healthz/` 都沒事。
 
 **`runtime_sa` 在宣告 `db` 時必填。** 共用的 `run-runtime` 沒有 Cloud SQL 權限
 ——「你有自己的資料庫，就有自己的身分」。不用 DB 的服務整段省略，沿用 `run-runtime`。
@@ -263,7 +269,8 @@ db:                        # 要用 Cloud SQL 才需要，只宣告一次
 | 只有某環境要的 | `.cicd/env.<env>`，**同名蓋過 common** | 同上 |
 | 機密的**值** | GCP Secret Manager | **開發者自己跑一次**（見下） |
 | 機密的**名字** | `.cicd/secrets.<env>` | 開發者，進版控 |
-| `APP_ENV` / `APP_VERSION` / DB 連線 | — | CI 依部署目標注入 |
+| `APP_ENV`、DB 連線 | — | CI 依部署目標注入 |
+| `APP_VERSION` | — | **只有 prod 注入**（值是 tag）。dev 不注入，app 端自己給預設值 |
 
 寫一個機密的值 —— 這是開發時的事，跟 CI 無關：
 
@@ -507,6 +514,8 @@ database 還沒建這類問題，**PR 階段查不到**。最早的 GCP 檢查�
 | `在 dev AR 找不到 sha-xxxxxxx` | 這個 commit 沒走過 main pipeline |
 | `複製後 digest 不一致` | promote 的重點就是逐位元組相同，不一致必須中止 |
 | dev 健康檢查失敗 | 容器沒監聽 `$PORT`（Cloud Run 注入，預設 8080） |
+| `health_path 不可以是 /healthz` | GCP 前端保留路徑，見「專案端契約」的警告。改用 `/health` |
+| smoke 回 404，但 `/` 打得到、request log 裡沒有那一筆 | 打到 `/healthz` 之類的保留路徑，請求沒進容器 |
 | `找不到共用 Cloud SQL instance` | 該環境還沒開 `apps-pg`。見「開共用 instance」 |
 | `找不到執行身分「run-…」` | SA 還沒建。照「一次性清單」跑一次 |
 | `宣告了 db 就必須指定 runtime_sa` | 共用的 `run-runtime` 沒有 Cloud SQL 權限，要用 DB 就要有自己的身分 |

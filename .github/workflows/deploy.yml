@@ -159,6 +159,16 @@ jobs:
             echo "::error::服務名稱 '$SERVICE' 超過 49 字元。"
             exit 1
           fi
+          # /healthz 是 GCP 前端的保留路徑：在 *.run.app 上請求會被攔下來回 Google 自己的
+          # 404，根本不會到容器（Cloud Run 的 request log 裡連那一筆都沒有）。smoke 打的
+          # 永遠是 run.app 網址，所以這個值在這條管線上不可能通過。擋在 verify 而不是等
+          # smoke 紅燈，是因為那時的錯誤訊息會指向「有沒有監聽 $PORT」—— 指到錯的地方。
+          # 只擋精確比對：實測 /healthz/ 與 /healthzz 都正常落到容器。
+          if [ "$HEALTH_PATH" = "/healthz" ]; then
+            echo "::error::health_path 不可以是 /healthz —— 那是 GCP 前端的保留路徑，在 *.run.app 上請求不會到你的容器。"
+            echo "::error::改用 /health 或其他路徑（只有精確的 /healthz 被攔）。"
+            exit 1
+          fi
 
           if [ ! -f "$DOCKERFILE" ]; then
             echo "::error::找不到 ${DOCKERFILE}。adamsourceinfo-org 的部署契約要求每個專案自備 Dockerfile。"

@@ -49,7 +49,12 @@ env:
   WIF_POOL: github
   WIF_PROVIDER: adamsourceinfo-org
   DEPLOYER_SA_ID: github-deployer
+  # 沒有自己資料庫的服務用這個共用執行身分。要用 DB 就必須在
+  # .cicd/config.yml 宣告自己的 runtime_sa —— 這個共用身分沒有 Cloud SQL 權限。
   RUNTIME_SA_ID: run-runtime
+  # 一個環境一台，服務靠 database 分隔。instance 由平台決定，
+  # 專案端沒有這個欄位可以寫錯。
+  SQL_INSTANCE: apps-pg
 
 jobs:
   # ── 1. verify ──────────────────────────────────────────────────────────────
@@ -65,7 +70,7 @@ jobs:
       health_path: ${{ steps.contract.outputs.health_path }}
       dockerfile: ${{ steps.contract.outputs.dockerfile }}
       allow_unauthenticated: ${{ steps.contract.outputs.allow_unauthenticated }}
-      db_instance: ${{ steps.contract.outputs.db_instance }}
+      runtime_sa: ${{ steps.contract.outputs.runtime_sa }}
       db_name: ${{ steps.contract.outputs.db_name }}
     steps:
       - uses: actions/checkout@v4
@@ -93,7 +98,7 @@ jobs:
               echo "::error::${CFG} 必須是 YAML mapping（key: value）。"; exit 1; }
 
             # 擋掉打錯的 key —— 設定檔最常見的失敗是「明明寫了卻沒生效」。
-            ALLOWED="service region health_path dockerfile allow_unauthenticated db"
+            ALLOWED="service region health_path dockerfile allow_unauthenticated runtime_sa db"
             for K in $(yq -r 'keys | .[]' "$CFG"); do
               case " $ALLOWED " in
                 *" $K "*) ;;
@@ -102,8 +107,14 @@ jobs:
             done
             for K in $(yq -r '.db // {} | keys | .[]' "$CFG"); do
               case "$K" in
-                instance|name) ;;
-                *) echo "::error::${CFG} 的 db 底下有不認得的設定 '${K}'。可用的是：instance name"; exit 1 ;;
+                name) ;;
+                instance)
+                  # 一個環境一台，instance 由平台決定。給明確的遷移訊息，
+                  # 不要讓它掉進「不認得的設定」那個泛用錯誤。
+                  echo "::error::${CFG} 的 db.instance 已移除 —— instance 現在由平台決定"
+                  echo "::error::（一個環境一台，服務靠 database 分隔）。請刪掉這一行，只留 db.name。"
+                  exit 1 ;;
+                *) echo "::error::${CFG} 的 db 底下有不認得的設定 '${K}'。可用的是：name"; exit 1 ;;
               esac
             done
           fi
@@ -125,11 +136,20 @@ jobs:
           HEALTH_PATH="$(cfg '.health_path' "$IN_HEALTH_PATH")"
           DOCKERFILE="$(cfg '.dockerfile' "$IN_DOCKERFILE")"
           UNAUTH="$(cfg '.allow_unauthenticated' "$IN_UNAUTH")"
-          DB_INSTANCE="$(cfg '.db.instance' '')"
           DB_NAME="$(cfg '.db.name' '')"
+          RUNTIME_SA="$(cfg '.runtime_sa' "$RUNTIME_SA_ID")"
 
-          if [ -n "$DB_INSTANCE" ] && [ -z "$DB_NAME" ]; then
-            echo "::error::${CFG} 宣告了 db.instance 就必須一併給 db.name。"; exit 1
+          # 共用的 run-runtime 刻意沒有 Cloud SQL 權限 —— 要用 DB 就要有自己的身分。
+          # 擋在這裡，否則會變成部署成功、上線才發現連不上。
+          if [ -n "$DB_NAME" ] && [ "$RUNTIME_SA" = "$RUNTIME_SA_ID" ]; then
+            echo "::error::${CFG} 宣告了 db 就必須指定 runtime_sa —— 共用的 ${RUNTIME_SA_ID} 沒有 Cloud SQL 權限。"
+            echo "::error::  runtime_sa: run-<服務名>"
+            exit 1
+          fi
+          # SA ID 的規則比 Cloud Run 服務名嚴格：6-30 字元。先擋掉，不然錯誤會在部署時才浮現。
+          if ! printf '%s' "$RUNTIME_SA" | grep -Eq '^[a-z][-a-z0-9]{4,28}[a-z0-9]$'; then
+            echo "::error::runtime_sa '${RUNTIME_SA}' 不是合法的 service account ID（6-30 字元，小寫字母開頭，只能有小寫字母/數字/連字號）。"
+            exit 1
           fi
           if ! printf '%s' "$SERVICE" | grep -Eq '^[a-z]([-a-z0-9]*[a-z0-9])?$'; then
             echo "::error::服務名稱 '$SERVICE' 不符合 Cloud Run 規則（小寫字母開頭，只能有小寫字母/數字/連字號）。請在 stub 用 service: 指定合法名稱。"
@@ -152,11 +172,11 @@ jobs:
             echo "health_path=$HEALTH_PATH"
             echo "dockerfile=$DOCKERFILE"
             echo "allow_unauthenticated=$UNAUTH"
-            echo "db_instance=$DB_INSTANCE"
+            echo "runtime_sa=$RUNTIME_SA"
             echo "db_name=$DB_NAME"
           } >> "$GITHUB_OUTPUT"
           echo "✅ service=$SERVICE  region=$REGION  dockerfile=$DOCKERFILE  sha=${GITHUB_SHA:0:7}"
-          [ -n "$DB_INSTANCE" ] && echo "   Cloud SQL：${DB_INSTANCE} / ${DB_NAME}（來自 ${CFG}，只宣告一次）"
+          [ -n "$DB_NAME" ] && echo "   Cloud SQL：${SQL_INSTANCE} / ${DB_NAME}（執行身分 ${RUNTIME_SA}）"
 
       - name: 檢查 .cicd 設定契約
         run: |
@@ -182,14 +202,15 @@ jobs:
           done
 
           # INSTANCE_CONNECTION_NAME / DB_USER 由 CI 依部署目標推導後注入；
-          # DB_INSTANCE / DB_NAME 現在宣告在 .cicd/config.yml（只寫一次）。
+          # DB_NAME 宣告在 .cicd/config.yml（只寫一次）；DB_INSTANCE 已經完全廢除
+          # —— instance 由平台的 SQL_INSTANCE 決定，專案端沒有這個概念。
           # 這些出現在 env 檔裡會跟注入值撞名，誰贏未定義 —— 擋下來比安靜地不確定好。
           for F in .cicd/env.common .cicd/env.dev .cicd/env.prod; do
             [ -f "$F" ] || continue
             for KEY in INSTANCE_CONNECTION_NAME DB_USER; do
               if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
                 echo "::error::${F} 不可以自己設定 ${KEY} —— 這個值由 CI 依部署目標推導。"
-                echo "::error::請在 .cicd/config.yml 宣告 db.instance 與 db.name。"
+                echo "::error::請在 .cicd/config.yml 宣告 db.name 與 runtime_sa。"
                 exit 1
               fi
             done
@@ -197,8 +218,7 @@ jobs:
               if grep -Eq "^[[:space:]]*${KEY}=" "$F"; then
                 echo "::error::${F} 的 ${KEY} 要搬到 .cicd/config.yml —— 那裡只宣告一次，不會 dev/prod 分歧："
                 echo "::error::  db:"
-                echo "::error::    instance: <instance 名稱>"
-                echo "::error::    name: <database 名稱>"
+                echo "::error::    name: <database 名稱>   # instance 由平台決定，不用寫"
                 exit 1
               fi
             done
@@ -332,7 +352,7 @@ jobs:
           UNAUTH: ${{ needs.verify.outputs.allow_unauthenticated }}
           ENV_NAME: dev
           PROJECT: adamsourceinfo-dev
-          DB_INSTANCE: ${{ needs.verify.outputs.db_instance }}
+          RUNTIME_SA: ${{ needs.verify.outputs.runtime_sa }}
           DB_NAME: ${{ needs.verify.outputs.db_name }}
         run: |
           set -euo pipefail
@@ -370,27 +390,41 @@ jobs:
           echo "已套用 .cicd/env.common + ${ENV_FILE}（合併模式，不會刪除既有變數）"
 
           # ── Cloud SQL ────────────────────────────────────────────────
-          # DB 在 .cicd/config.yml 只宣告一次（不是 dev/prod 各一份）。連線字串與 DB 帳號
-          # 由 CI 依「正在部署哪個環境」推導 —— 連錯環境不是「會被抓到」，是根本沒有
-          # 欄位可以寫錯。前提：Cloud SQL 與 Cloud Run 同區域。
-          if [ -n "${DB_INSTANCE:-}" ]; then
-            ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+          # 一個環境一台 instance，服務靠 database 分隔。專案只在 .cicd/config.yml
+          # 宣告 db.name 與 runtime_sa；instance 與連線字串由 CI 依「正在部署哪個環境」
+          # 推導 —— 連錯環境、連錯 instance 都不是「會被抓到」，是根本沒有欄位可以寫錯。
+          # 隔離不來自 IAM（cloudsql.instanceUser 只能綁專案層），來自每個 database 的
+          # REVOKE CONNECT FROM PUBLIC + 逐服務 GRANT。前提：Cloud SQL 與 Cloud Run 同區域。
+          if [ -n "${DB_NAME:-}" ]; then
+            ICN="${PROJECT}:${REGION}:${SQL_INSTANCE}"
 
-            # instance 不存在就停在這裡，講清楚缺什麼、誰該補。
-            # 刻意不自動建立：要 10 分鐘、會計費，而且 config.yml 打錯一個字就多開一台。
-            # Cloud Run service 本身則相反 —— gcloud run deploy 沒有就建，有就更新。
-            if ! gcloud sql instances describe "$DB_INSTANCE" --project="$PROJECT" >/dev/null 2>&1; then
-              echo "::error::${PROJECT} 找不到 Cloud SQL instance「${DB_INSTANCE}」（.cicd/config.yml 的 db.instance）。"
-              echo "::error::這是一次性資源，要有 GCP 權限的人跑一次，不是 CI 的職責："
-              echo "::error::  gcloud sql instances create ${DB_INSTANCE} --project=${PROJECT} --region=${REGION} \\"
+            # 共用 instance 不存在就停在這裡。這是平台級的一次性資源，
+            # 刻意不自動建立：要 10 分鐘、會計費。
+            if ! gcloud sql instances describe "$SQL_INSTANCE" --project="$PROJECT" >/dev/null 2>&1; then
+              echo "::error::${PROJECT} 找不到共用 Cloud SQL instance「${SQL_INSTANCE}」。"
+              echo "::error::這是平台級的一次性資源，見 ci/README.md「開共用 instance」："
+              echo "::error::  gcloud sql instances create ${SQL_INSTANCE} --project=${PROJECT} --region=${REGION} \\"
               echo "::error::    --edition=ENTERPRISE --database-version=POSTGRES_17 --tier=db-f1-micro \\"
               echo "::error::    --database-flags=cloudsql.iam_authentication=on"
-              echo "::error::建完還要 create database / IAM user / GRANT —— 完整步驟見 ci/README.md「服務要用資料庫」。"
               exit 1
             fi
-            PAIRS="${PAIRS}@@DB_INSTANCE=${DB_INSTANCE}@@DB_NAME=${DB_NAME}"
-            PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
-            echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
+
+            # 執行身分同樣是一次性資源。CI 刻意沒有 iam.* 權限 —— 一個能建 SA
+            # 又能發角色的部署身分，等於能把任何權限發給自己，WIF 那道鎖就白做了。
+            if ! gcloud iam service-accounts describe \
+                 "${RUNTIME_SA}@${PROJECT}.iam.gserviceaccount.com" --project="$PROJECT" >/dev/null 2>&1; then
+              echo "::error::${PROJECT} 找不到執行身分「${RUNTIME_SA}」（.cicd/config.yml 的 runtime_sa）。"
+              echo "::error::這是一次性資源，要有 GCP 權限的人跑一次，不是 CI 的職責："
+              echo "::error::  gcloud iam service-accounts create ${RUNTIME_SA} --project=${PROJECT}"
+              echo "::error::還要授 cloudsql.client / cloudsql.instanceUser、綁 deployer 的 serviceAccountUser、"
+              echo "::error::補 secret accessor、建 database「${DB_NAME}」、建 IAM DB user、下 REVOKE/GRANT ——"
+              echo "::error::完整步驟見 ci/README.md「服務要用資料庫」。"
+              exit 1
+            fi
+
+            PAIRS="${PAIRS}@@DB_NAME=${DB_NAME}"
+            PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA}@${PROJECT}.iam"
+            echo "已推導 Cloud SQL：${ICN} / ${DB_NAME}（DB 帳號 ${RUNTIME_SA}@${PROJECT}.iam）"
           fi
 
           SEC_PAIRS=""
@@ -406,7 +440,7 @@ jobs:
             --image="$IMAGE"
             --region="$REGION"
             --project="$PROJECT"
-            --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
+            --service-account="${RUNTIME_SA}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
             "--update-env-vars=^@@^${PAIRS}"
@@ -620,7 +654,7 @@ jobs:
           APP_VERSION: ${{ github.ref_name }}
           ENV_NAME: prod
           PROJECT: adamsourceinfo-prod
-          DB_INSTANCE: ${{ needs.verify.outputs.db_instance }}
+          RUNTIME_SA: ${{ needs.verify.outputs.runtime_sa }}
           DB_NAME: ${{ needs.verify.outputs.db_name }}
         run: |
           set -euo pipefail
@@ -658,27 +692,41 @@ jobs:
           echo "已套用 .cicd/env.common + ${ENV_FILE}（合併模式，不會刪除既有變數）"
 
           # ── Cloud SQL ────────────────────────────────────────────────
-          # DB 在 .cicd/config.yml 只宣告一次（不是 dev/prod 各一份）。連線字串與 DB 帳號
-          # 由 CI 依「正在部署哪個環境」推導 —— 連錯環境不是「會被抓到」，是根本沒有
-          # 欄位可以寫錯。前提：Cloud SQL 與 Cloud Run 同區域。
-          if [ -n "${DB_INSTANCE:-}" ]; then
-            ICN="${PROJECT}:${REGION}:${DB_INSTANCE}"
+          # 一個環境一台 instance，服務靠 database 分隔。專案只在 .cicd/config.yml
+          # 宣告 db.name 與 runtime_sa；instance 與連線字串由 CI 依「正在部署哪個環境」
+          # 推導 —— 連錯環境、連錯 instance 都不是「會被抓到」，是根本沒有欄位可以寫錯。
+          # 隔離不來自 IAM（cloudsql.instanceUser 只能綁專案層），來自每個 database 的
+          # REVOKE CONNECT FROM PUBLIC + 逐服務 GRANT。前提：Cloud SQL 與 Cloud Run 同區域。
+          if [ -n "${DB_NAME:-}" ]; then
+            ICN="${PROJECT}:${REGION}:${SQL_INSTANCE}"
 
-            # instance 不存在就停在這裡，講清楚缺什麼、誰該補。
-            # 刻意不自動建立：要 10 分鐘、會計費，而且 config.yml 打錯一個字就多開一台。
-            # Cloud Run service 本身則相反 —— gcloud run deploy 沒有就建，有就更新。
-            if ! gcloud sql instances describe "$DB_INSTANCE" --project="$PROJECT" >/dev/null 2>&1; then
-              echo "::error::${PROJECT} 找不到 Cloud SQL instance「${DB_INSTANCE}」（.cicd/config.yml 的 db.instance）。"
-              echo "::error::這是一次性資源，要有 GCP 權限的人跑一次，不是 CI 的職責："
-              echo "::error::  gcloud sql instances create ${DB_INSTANCE} --project=${PROJECT} --region=${REGION} \\"
+            # 共用 instance 不存在就停在這裡。這是平台級的一次性資源，
+            # 刻意不自動建立：要 10 分鐘、會計費。
+            if ! gcloud sql instances describe "$SQL_INSTANCE" --project="$PROJECT" >/dev/null 2>&1; then
+              echo "::error::${PROJECT} 找不到共用 Cloud SQL instance「${SQL_INSTANCE}」。"
+              echo "::error::這是平台級的一次性資源，見 ci/README.md「開共用 instance」："
+              echo "::error::  gcloud sql instances create ${SQL_INSTANCE} --project=${PROJECT} --region=${REGION} \\"
               echo "::error::    --edition=ENTERPRISE --database-version=POSTGRES_17 --tier=db-f1-micro \\"
               echo "::error::    --database-flags=cloudsql.iam_authentication=on"
-              echo "::error::建完還要 create database / IAM user / GRANT —— 完整步驟見 ci/README.md「服務要用資料庫」。"
               exit 1
             fi
-            PAIRS="${PAIRS}@@DB_INSTANCE=${DB_INSTANCE}@@DB_NAME=${DB_NAME}"
-            PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA_ID}@${PROJECT}.iam"
-            echo "已推導 Cloud SQL：${ICN}（DB 帳號 ${RUNTIME_SA_ID}@${PROJECT}.iam）"
+
+            # 執行身分同樣是一次性資源。CI 刻意沒有 iam.* 權限 —— 一個能建 SA
+            # 又能發角色的部署身分，等於能把任何權限發給自己，WIF 那道鎖就白做了。
+            if ! gcloud iam service-accounts describe \
+                 "${RUNTIME_SA}@${PROJECT}.iam.gserviceaccount.com" --project="$PROJECT" >/dev/null 2>&1; then
+              echo "::error::${PROJECT} 找不到執行身分「${RUNTIME_SA}」（.cicd/config.yml 的 runtime_sa）。"
+              echo "::error::這是一次性資源，要有 GCP 權限的人跑一次，不是 CI 的職責："
+              echo "::error::  gcloud iam service-accounts create ${RUNTIME_SA} --project=${PROJECT}"
+              echo "::error::還要授 cloudsql.client / cloudsql.instanceUser、綁 deployer 的 serviceAccountUser、"
+              echo "::error::補 secret accessor、建 database「${DB_NAME}」、建 IAM DB user、下 REVOKE/GRANT ——"
+              echo "::error::完整步驟見 ci/README.md「服務要用資料庫」。"
+              exit 1
+            fi
+
+            PAIRS="${PAIRS}@@DB_NAME=${DB_NAME}"
+            PAIRS="${PAIRS}@@INSTANCE_CONNECTION_NAME=${ICN}@@DB_USER=${RUNTIME_SA}@${PROJECT}.iam"
+            echo "已推導 Cloud SQL：${ICN} / ${DB_NAME}（DB 帳號 ${RUNTIME_SA}@${PROJECT}.iam）"
           fi
 
           SEC_PAIRS=""
@@ -694,7 +742,7 @@ jobs:
             --image="$IMAGE"
             --region="$REGION"
             --project="$PROJECT"
-            --service-account="${RUNTIME_SA_ID}@${PROJECT}.iam.gserviceaccount.com"
+            --service-account="${RUNTIME_SA}@${PROJECT}.iam.gserviceaccount.com"
             --platform=managed
             --quiet
             "--update-env-vars=^@@^${PAIRS}"

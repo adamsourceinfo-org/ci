@@ -25,6 +25,13 @@
 - CI 一律 `--update-*` / `--add-*`，從不 `--set-*`
 - Phase 3 之前不刪除任何舊 instance
 - `gh run rerun` 會沿用舊版 reusable workflow，一律推新 commit / 新 tag 觸發
+- **tag 規則**：CI 只收 `vX.Y.Z`，`v20260824-1` 這種會被擋下。打之前先 `git tag -l` 看現有的再遞增。
+  現況（2026-08-24）：`hello-db` v1.0.0、`hello-cicd` v0.6.0、`payment-ecpay` v0.1.0、`payment-paypal` v0.2.1
+- **`gh run watch` 不帶 run id 會進互動模式**，在非互動 shell 會失敗。改用
+  `gh run list --repo <repo> --limit 1 --json databaseId,status,conclusion` 輪詢
+- **prod 兩個金流 database 完全是空的**（只有 `schema_migrations`），dev 有測試資料。
+  migration 由 app 啟動時自動套用（`run_migrations()` + advisory lock），不需人工跑；
+  但 migration 失敗**不會擋住啟動**，所以驗證要看健康檢查的 `db.ok`，不能只看 HTTP 200
 
 ---
 
@@ -497,7 +504,7 @@ db:
 ```bash
 cd hello-db && git add .cicd/config.yml \
   && git commit -m "切到共用 apps-pg 與專屬執行身分" && git push
-gh run watch --repo adamsourceinfo-org/hello-db
+gh run list --repo adamsourceinfo-org/hello-db --limit 1 --json databaseId,status,conclusion
 ```
 
 - [ ] **Step 3: 驗 dev**
@@ -513,8 +520,8 @@ Expected：`instance` 是 `adamsourceinfo-dev:asia-east1:apps-pg`、
 - [ ] **Step 4: 打 tag 上 prod 並驗證**
 
 ```bash
-cd hello-db && git tag v$(date +%Y%m%d)-1 && git push --tags
-gh run watch --repo adamsourceinfo-org/hello-db
+cd hello-db && git tag vX.Y.Z && git push --tags   # 見下方「tag 規則」
+gh run list --repo adamsourceinfo-org/hello-db --limit 1 --json databaseId,status,conclusion
 URL=$(gcloud run services describe hello-db --project=adamsourceinfo-prod --region=asia-east1 --format='value(status.url)')
 curl -s "$URL/" | python3 -m json.tool
 ```
@@ -543,7 +550,7 @@ db:
 ```bash
 cd hello-cicd && git add .cicd/config.yml \
   && git commit -m "切到共用 apps-pg 與專屬執行身分" && git push
-gh run watch --repo adamsourceinfo-org/hello-cicd
+gh run list --repo adamsourceinfo-org/hello-cicd --limit 1 --json databaseId,status,conclusion
 ```
 
 - [ ] **Step 3: 驗 dev**
@@ -559,8 +566,8 @@ Expected：`instance` 是 `adamsourceinfo-dev:asia-east1:apps-pg`、
 - [ ] **Step 4: 打 tag 上 prod 並驗證**
 
 ```bash
-cd hello-cicd && git tag v$(date +%Y%m%d)-1 && git push --tags
-gh run watch --repo adamsourceinfo-org/hello-cicd
+cd hello-cicd && git tag vX.Y.Z && git push --tags   # 見下方「tag 規則」
+gh run list --repo adamsourceinfo-org/hello-cicd --limit 1 --json databaseId,status,conclusion
 URL=$(gcloud run services describe hello-cicd --project=adamsourceinfo-prod --region=asia-east1 --format='value(status.url)')
 curl -s "$URL/" | python3 -m json.tool
 ```
@@ -573,6 +580,12 @@ Expected：`db_user` 是 `run-hello-cicd@adamsourceinfo-prod.iam`
 
 **Files:**
 - Modify: `payment-ecpay/.cicd/config.yml`
+
+- [ ] **Step 0: 修掉硬寫舊 instance 名的操作腳本**
+
+`scripts/add-caller.sh` 的 `INSTANCE="payment-ecpay-pg"` 要改成 `apps-pg`，
+註解裡的 `--instance=` 與「表的擁有者是 run-runtime」也一併改成新 SA。
+舊 instance 一刪，這支腳本就會連到不存在的東西。
 
 - [ ] **Step 1: 改 config**
 
@@ -599,12 +612,31 @@ gcloud run revisions list --service=payment-ecpay --project=adamsourceinfo-dev \
 
 - [ ] **Step 4: 打 tag、驗 prod**
 
+- [ ] **Step 5: 重發 dev 的測試 API key**
+
+新 database 是空的，`api_keys` 沒有任何 caller。切換前 dev 有一個
+`smoke-test`（scopes `orders:read,orders:write,subscriptions:read,subscriptions:write,events:read`，
+備註「端對端測試用」）。key hash 不可逆，只能重發：
+
+```bash
+cd payment-ecpay && ./scripts/add-caller.sh dev smoke-test \
+  "orders:read,orders:write,subscriptions:read,subscriptions:write,events:read" "端對端測試用"
+```
+
+明文 key 只會出現這一次，記得收好。prod 原本就沒有任何 caller，不用補。
+
 ---
 
 ### Task 9: `payment-paypal` 切換（最後，掛 live webhook）
 
 **Files:**
 - Modify: `payment-paypal/.cicd/config.yml`
+
+- [ ] **Step 0: 修掉硬寫舊 instance 名的操作腳本**
+
+`scripts/add-caller.sh` 的 `INSTANCE="payment-paypal-pg"` 與 `README.md` 裡的
+`--instance=payment-paypal-pg` 都要改成 `apps-pg`，SA 也從 `run-runtime` 換成
+`run-payment-paypal`。
 
 - [ ] **Step 1: 改 config**
 
@@ -628,6 +660,20 @@ curl -s -o /dev/null -w '%{http_code}\n' "$URL/health"
 ```
 
 Expected：`200`
+
+- [ ] **Step 5: 重發 dev 的兩個測試 API key**
+
+切換前 dev 有 `smoke-test`（全 scopes，「sandbox 實測用」）與
+`other-caller`（`orders:read,orders:write`，「隔離測試用」）：
+
+```bash
+cd payment-paypal
+./scripts/add-caller.sh dev smoke-test \
+  "orders:read,orders:write,plans:read,plans:write,subscriptions:read,subscriptions:write,events:read" "sandbox 實測用"
+./scripts/add-caller.sh dev other-caller "orders:read,orders:write" "隔離測試用"
+```
+
+prod 原本就沒有任何 caller，不用補。
 
 ---
 

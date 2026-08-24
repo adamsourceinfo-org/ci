@@ -264,11 +264,111 @@ jobs:
           set -euo pipefail
           docker build -f "$DOCKERFILE" -t "ci-check:${GITHUB_SHA:0:7}" .
           echo "✅ image 建置成功"
+  # ── 1.5 preflight ─────────────────────────────────────────────────────────
+  # 在 build 之前確認 GCP 那邊的一次性資源都到位。沒有這個 job 的話，缺一個 SA
+  # 會先白跑 36 秒的 build、把一個 image 永久留在 AR，才在部署那步撞牆（實測）。
+  #
+  # 只查「部署身分本來就看得到」的三項。角色綁定 / DB user / GRANT 查不到 ——
+  # 那需要 getIamPolicy 與 cloudsql.users.list，刻意不為此擴權，因為那會侵蝕
+  # 「部署身分沒有 iam.*」這條線。那三項由 ci/scripts/provision-service.sh
+  # 在人這一端驗（人的憑證查得到）。
+  #
+  # 刻意不順便檢查另一個環境：這個 job 拿的是本環境的憑證，看不到另一個專案，
+  # 加上去只會變成每次都警告，而每次都出現的警告等於沒有警告。「prod 忘了
+  # provision」的根因由 provision-service.sh 預設就做兩個環境解決。
+  #
+  # job 層只擋 PR（與其他碰 GCP 的 job 一致）；不用 DB 的服務改在 step 層跳過，
+  # 這樣下游的 needs 就不必寫 always() 那套條件體操。
+  preflight:
+    name: 1.5 preflight
+    if: github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TARGET_PROJECT: ${{ github.ref_type == 'tag' && 'adamsourceinfo-prod' || 'adamsourceinfo-dev' }}
+      TARGET_NUMBER: ${{ github.ref_type == 'tag' && '197982716696' || '606393814183' }}
+    steps:
+      - uses: google-github-actions/auth@v2
+        if: needs.verify.outputs.db_name != ''
+        with:
+          project_id: ${{ env.TARGET_PROJECT }}
+          workload_identity_provider: projects/${{ env.TARGET_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA_ID }}@${{ env.TARGET_PROJECT }}.iam.gserviceaccount.com
+
+      - name: 檢查一次性資源
+        if: needs.verify.outputs.db_name != ''
+        env:
+          PROJECT: ${{ env.TARGET_PROJECT }}
+          SERVICE: ${{ needs.verify.outputs.service }}
+          RUNTIME_SA: ${{ needs.verify.outputs.runtime_sa }}
+          DB_NAME: ${{ needs.verify.outputs.db_name }}
+        run: |
+          set -uo pipefail
+          command -v gcloud >/dev/null || { echo "::error::runner 沒有預裝 gcloud"; exit 1; }
+          MISSING=0
+
+          # 把 stderr 收下來再判斷 ——「查不到」和「不存在」是兩件事。
+          # 印成同一句話會把人帶往完全錯的方向：實測 iam.googleapis.com 沒開時，
+          # 訊息說「找不到執行身分」但那個 SA 明明存在，而且專案 owner 自己
+          # 呼叫得動，所以手動驗證完全重現不出來。
+          probe() {  # probe <描述> <補救提示> <指令...>
+            local what="$1" hint="$2"; shift 2
+            local err api
+            if err="$("$@" 2>&1 >/dev/null)"; then return 0; fi
+            if printf '%s' "$err" | grep -qE 'SERVICE_DISABLED|has not been used in project|it is disabled'; then
+              # API 名字通常藏在錯誤裡的 console URL（…/apis/api/<name>/overview）。
+              api="$(printf '%s' "$err" | grep -oE '[a-z][a-z0-9-]*\.googleapis\.com' | head -1)"
+              if [ -n "$api" ]; then
+                echo "::error::查不到${what} —— ${PROJECT} 沒有啟用 ${api}："
+                echo "::error::  gcloud services enable ${api} --project=${PROJECT}"
+              else
+                # 解析不出名字就把原文吐出來。吞掉線索正是這個 probe 要修的問題本身。
+                echo "::error::查不到${what} —— ${PROJECT} 有 API 未啟用，但解析不出名稱。原文："
+                printf '%s\n' "$err" | head -3 | sed 's/^/::error::  /'
+              fi
+            else
+              echo "::error::${PROJECT} 找不到${what}。${hint}"
+              # 非預期的錯誤（權限、網路）也要看得到，不然又是一句話打發兩種病因。
+              printf '%s' "$err" | grep -qiE 'not found|does not exist|NOT_FOUND' \
+                || printf '%s\n' "$err" | head -2 | sed 's/^/::error::  /'
+            fi
+            MISSING=1
+          }
+
+          # 三項全部跑完再回報 —— 撞到第一個就 exit 會讓人來回三趟。
+          probe "共用 Cloud SQL instance「${SQL_INSTANCE}」" \
+                "見 ci/README.md「開共用 instance」。" \
+                gcloud sql instances describe "$SQL_INSTANCE" --project="$PROJECT"
+
+          probe "database「${DB_NAME}」" \
+                "跑 ci/scripts/provision-service.sh。" \
+                gcloud sql databases describe "$DB_NAME" --instance="$SQL_INSTANCE" --project="$PROJECT"
+
+          probe "執行身分「${RUNTIME_SA}」" \
+                "跑 ci/scripts/provision-service.sh。" \
+                gcloud iam service-accounts describe \
+                  "${RUNTIME_SA}@${PROJECT}.iam.gserviceaccount.com" --project="$PROJECT"
+
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::一次性資源不齊，停在 build 之前。一次補齊（會做兩個環境）："
+            echo "::error::  ci/scripts/provision-service.sh ${SERVICE} ${RUNTIME_SA} ${DB_NAME}"
+            exit 1
+          fi
+          echo "✅ ${PROJECT}：instance / database / 執行身分都在"
+
+      - name: 這個服務不用 DB
+        if: needs.verify.outputs.db_name == ''
+        run: echo "沒有宣告 db，略過 GCP 前置檢查（執行身分會退回共用的 run-runtime）"
+
+
 
   build-push:
     name: 2 build-push → dev AR
     if: github.event_name != 'pull_request' && github.ref_type == 'branch'
-    needs: verify
+    needs: [verify, preflight]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -402,7 +502,7 @@ jobs:
   resolve:
     name: 5 resolve digest
     if: github.event_name != 'pull_request' && github.ref_type == 'tag'
-    needs: verify
+    needs: [verify, preflight]
     runs-on: ubuntu-latest
     permissions:
       contents: read

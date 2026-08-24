@@ -101,7 +101,10 @@ runs:
         }
 
         PAIRS="APP_ENV=${ENV_NAME}"
-        [ -n "${APP_VERSION:-}" ] && PAIRS="${PAIRS}@@APP_VERSION=${APP_VERSION}"
+        # 用 if 而不是 `[ -n … ] && …`：後者在 APP_VERSION 為空時回傳 1，只要哪天它
+        # 變成 step 的最後一個指令，set -e 就會讓整個 step **不印任何錯誤**地失敗。
+        # 同樣的寫法在 verify 裡潛伏過很久（見 ci#15）。dev 走的正是這條空值路徑。
+        if [ -n "${APP_VERSION:-}" ]; then PAIRS="${PAIRS}@@APP_VERSION=${APP_VERSION}"; fi
         while IFS= read -r line; do
           if [ -n "$line" ]; then PAIRS="${PAIRS}@@${line}"; fi
         done <<< "$(merge '.cicd/env.common' "$ENV_FILE")"

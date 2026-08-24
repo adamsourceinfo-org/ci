@@ -42,9 +42,13 @@ NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
 
 # 1. API。sqladmin 一定要開，即使還沒有 Cloud SQL —— 部署帶 --add-cloudsql-instances
 #    時 gcloud 會要求它已啟用，在 CI 的 --quiet 下是直接「Aborted by user」。
+# iam.googleapis.com 也不能省：部署會用 gcloud iam service-accounts describe
+#    確認 runtime_sa 存在。沒開的話那個檢查一律失敗 —— 而且是「SA 明明在」
+#    卻報找不到，最難查的那種。專案 owner 自己呼叫得動，所以不會在手動測試時暴露。
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
   iamcredentials.googleapis.com sts.googleapis.com secretmanager.googleapis.com \
   cloudresourcemanager.googleapis.com sqladmin.googleapis.com \
+  iam.googleapis.com \
   --project="$PROJECT" --quiet
 
 # 2. Artifact Registry
@@ -99,6 +103,16 @@ gcloud artifacts repositories add-iam-policy-binding apps \
 
 > 剛建好的 SA 不會立刻出現在 IAM policy API，`add-iam-policy-binding` 可能回
 > "does not exist"。等幾秒重試即可。
+
+> ⚠️ **`add-iam-policy-binding` 是對專案 policy 做 read-modify-write。** 併發跑（例如
+> 用迴圈同時建好幾個 SA 的綁定）會撞 etag，**其中一筆可能靜靜地沒生效**。實測踩過：
+> 八個 SA 有一個掉了綁定，症狀是部署成功但 DB 連線 `InterfaceError: communication error`。
+> 不要把輸出丟進 `/dev/null`，收尾一定要複查：
+>
+> ```bash
+> gcloud projects get-iam-policy "$PROJECT" --flatten="bindings[].members" \
+>   --filter="bindings.members:run-my-app@" --format="value(bindings.role)"
+> ```
 
 ### 開共用 instance（每個環境一台）
 
@@ -519,3 +533,6 @@ attribute.job_workflow_ref ==
 | `Database username ... without ".gserviceaccount.com"` | `sql users create` 要用短格式 `<runtime_sa>@<專案>.iam` |
 | `Invalid Tier (db-f1-micro) for (ENTERPRISE_PLUS)` | 建 instance 要加 `--edition=ENTERPRISE` |
 | proxy `invalid_grant / invalid_rapt` | 本機 ADC 過期。加 `--token "$(gcloud auth print-access-token)"` |
+| `找不到執行身分「run-…」`，但 SA 明明存在 | 該專案沒開 `iam.googleapis.com`。owner 自己呼叫得動，所以手動測試不會暴露 |
+| 部署成功但 DB `InterfaceError: communication error` | SA 少了 `cloudsql.client` / `instanceUser`。併發下的 `add-iam-policy-binding` 可能靜靜掉一筆，複查 |
+| 自己用 psql 看不到 app 建的表 | 表的擁有者是服務的 SA。`GRANT "<runtime_sa>@<專案>.iam" TO "<你的帳號>"` |

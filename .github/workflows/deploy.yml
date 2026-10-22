@@ -14,7 +14,7 @@ on:
   workflow_call:
     inputs:
       service:
-        description: "Cloud Run 服務名稱。留空則用 caller repo 名稱"
+        description: "Cloud Run 服務名稱。必須等於 caller repo 名稱（留空即是）"
         type: string
         required: false
         default: ""
@@ -157,6 +157,21 @@ jobs:
           fi
           if [ ${#SERVICE} -gt 49 ]; then
             echo "::error::服務名稱 '$SERVICE' 超過 49 字元。"
+            exit 1
+          fi
+          # 服務名與執行身分綁死在呼叫端 repo 上。WIF 只驗「是不是這支 workflow」，
+          # 而部署身分對「每一個」執行身分都有 serviceAccountUser —— 如果這兩個值由
+          # 呼叫端自己報，org 裡任何一個 repo 改一行 config.yml 就能部署成別的服務、
+          # 拿別的服務的 DB 與機密。GITHUB_REPOSITORY 在 reusable workflow 裡是呼叫端
+          # 的 repo，由 GitHub 填，呼叫端改不了。
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          if [ "$SERVICE" != "$REPO_NAME" ]; then
+            echo "::error::service '${SERVICE}' 必須等於 repo 名稱 '${REPO_NAME}'。"
+            echo "::error::部署身分動得了每一個服務，所以「部署哪個服務」不能由呼叫端自己報。刪掉 service 設定即可（預設就是 repo 名稱）。"
+            exit 1
+          fi
+          if [ "$RUNTIME_SA" != "$RUNTIME_SA_ID" ] && [ "$RUNTIME_SA" != "run-${SERVICE}" ]; then
+            echo "::error::runtime_sa '${RUNTIME_SA}' 不屬於這個服務。只能是 run-${SERVICE}（有 DB）或省略（沿用共用的 ${RUNTIME_SA_ID}）。"
             exit 1
           fi
           # smoke 是 "${URL%/}${HEALTH_PATH}" 直接字串相接，少一個斜線不會變成相對路徑，

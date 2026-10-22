@@ -45,6 +45,12 @@ printf '%s' "$SA" | grep -Eq '^[a-z][-a-z0-9]{4,28}[a-z0-9]$' || {
   echo "runtime_sa '$SA' 不合法：6-30 字元、小寫字母開頭、只能有小寫字母/數字/連字號。" >&2
   exit 1; }
 
+# CI 的 verify 只接受 run-<服務名>（服務名綁定 repo，見 README「權限模型」）。
+# 在這裡先擋，不然會備妥一個 CI 永遠不肯用的身分。
+[ "$SA" = "run-${SERVICE}" ] || {
+  echo "runtime_sa 必須是 run-${SERVICE}（收到 '$SA'）—— CI 只接受這個名字。" >&2
+  exit 1; }
+
 case "$WHICH" in
   dev|prod) ENVS="$WHICH" ;;
   both)     ENVS="dev prod" ;;

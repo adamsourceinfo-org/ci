@@ -236,13 +236,13 @@ my-app/
 放**一次性、不該 dev/prod 分歧**的東西。整份選填，沒有這個檔就用預設值。
 
 ```yaml
-service: my-app            # 預設用 repo 名稱
+service: my-app            # 必須等於 repo 名稱（預設就是），通常省略
 region: asia-east1
 health_path: /health       # 預設 /。不要用 /healthz，見下面的警告
 dockerfile: Dockerfile
 allow_unauthenticated: true
 
-runtime_sa: run-my-app     # 執行身分。要用 Cloud SQL 就必填
+runtime_sa: run-my-app     # 執行身分，只能是 run-<服務名>。要用 Cloud SQL 就必填
 db:                        # 要用 Cloud SQL 才需要，只宣告一次
   name: my_app             # instance 由平台決定（一個環境一台 apps-pg）
 ```
@@ -253,8 +253,9 @@ db:                        # 要用 Cloud SQL 才需要，只宣告一次
 > 講的是「檢查有沒有監聽 `$PORT`」。`verify` 已經會擋下這個值。只有**精確**的 `/healthz`
 > 被攔，`/health`、`/healthz/` 都沒事。
 
-**`runtime_sa` 在宣告 `db` 時必填。** 共用的 `run-runtime` 沒有 Cloud SQL 權限
+**`runtime_sa` 在宣告 `db` 時必填，而且只能是 `run-<服務名>`。** 共用的 `run-runtime` 沒有 Cloud SQL 權限
 ——「你有自己的資料庫，就有自己的身分」。不用 DB 的服務整段省略，沿用 `run-runtime`。
+`service` 與 `runtime_sa` 都綁死在 repo 上，理由見「權限模型」的「服務名綁定 repo」。
 
 打錯的 key 會被擋下並列出可用名字 —— 設定檔最常見的失敗是「明明寫了卻沒生效」。
 
@@ -487,6 +488,23 @@ attribute.job_workflow_ref ==
 
 **部署身分沒有 `iam.*`** —— 建 SA、授 IAM 都做不到。所以上面那份 runbook 才必須由人跑。
 
+### 服務名綁定 repo
+
+WIF 只驗「是不是 ci 的這支 workflow」，不驗**是哪個 repo 呼叫的**；而部署身分對**每一個**
+執行身分都有 `serviceAccountUser`。所以「部署哪個服務、用哪個身分」如果由呼叫端的
+`config.yml` 自己報，org 裡任何一個 repo 改一行就能部署成別的服務，拿到別人的 DB 與機密 ——
+private repo 在 Free 方案上沒有分支保護，有 write 權限的協作者甚至不用經過 PR。
+
+`verify` 因此強制：
+
+| 設定 | 只能是 |
+|---|---|
+| `service` | repo 名稱（`GITHUB_REPOSITORY` 由 GitHub 填，呼叫端改不了） |
+| `runtime_sa` | `run-<服務名>`，或省略（沿用共用的 `run-runtime`） |
+
+真的需要服務名與 repo 名不同時，做法是在 ci repo 放一份由 owner 維護的對照表，
+**不是**放寬這條檢查。
+
 ### PR 拿不到憑證
 
 `deploy.yml` 同時服務 PR 與部署，界線由兩件事守住：
@@ -524,6 +542,8 @@ database 還沒建這類問題，**PR 階段查不到**。最早的 GCP 檢查�
 | `找不到執行身分「run-…」` | SA 還沒建。照「一次性清單」跑一次 |
 | `宣告了 db 就必須指定 runtime_sa` | 共用的 `run-runtime` 沒有 Cloud SQL 權限，要用 DB 就要有自己的身分 |
 | `runtime_sa '…' 不是合法的 service account ID` | 6–30 字元、小寫字母開頭，只能有小寫字母/數字/連字號 |
+| `service '…' 必須等於 repo 名稱` | 服務名綁定 repo，見「權限模型」。刪掉 `service` 設定即可 |
+| `runtime_sa '…' 不屬於這個服務` | 只能是 `run-<服務名>` 或省略。不能借用別的服務的身分 |
 | `db.instance 已移除` | 舊格式。刪掉那行，只留 `db.name` |
 | `不可以自己設定 INSTANCE_CONNECTION_NAME` | CI 保留字。改在 `config.yml` 宣告 `db.name` 與 `runtime_sa` |
 | `Bad syntax for dict arg` | `.cicd/*` 的值裡有 `@@`，撞到自訂分隔符 |
